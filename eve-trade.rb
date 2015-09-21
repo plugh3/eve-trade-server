@@ -136,69 +136,54 @@ def load_db_sdd(db_name, db_table, dst_type, dst_store, fieldmap)
   end
 end
 
+
+### Datum -- wrapper class for game data types in static data dump (SDD)
+### individual objects can be accessed via class methods: 
+###   [id]
+###   [name] 
+###   each
+### subclass for each data type
 class Datum
+  attr_reader :id, :name
+  @data = {}
   def initialize(fields={})
     fields.each { |k,v| instance_variable_set("@#{k}", v) }
   end
 
-=begin
-  @@_items = {}   ### singleton datastore, hash of Item instances indexed both by id and name
   def self.[](id)
-    _load_db
-    @@_items[id]
+    _load_db(@data)
+    @data[id]
   end
   def self.[]=(id, rval)
-    _load_db
-    @@_regions[id] = rval
+    _load_db(@data)
+    @data[id] = rval
   end
-=end
+  def self.each
+    _load_db(@data)
+    @data.values.uniq.each { |v| yield(v.id, v) }  ### filter out duplicate indexes
+  end  
   
   def self._load_db(datastore)
     load_db_sdd(@sdd_db, @sdd_db_table, self.to_s, datastore, @sdd_db_fieldmap)
   end
-  
-  ### TODO: define in subclass
-  ###   @sdd_db
-  ###   @sdd_db_table
-  ###   @sdd_db_fieldmap
 end
 
-### Item class - wrapper class for item info 
-### from (a) EVE static data dump DB (id, name, volume) and (b) CREST (href)
-### usage:
+
+### Item class - wrapper class for item data 
+### usage
 ###   Item[id].field
 ###   Item[name].field
-### fields:
+### fields
 ###   id
 ###   name
 ###   volume
 ###   href
-###   data_sdd
-###   data_crest
 class Item < Datum
-  ### instance
-  attr_accessor   :id, :name, :volume, :href
-
-  ###
-  ### class
-  ###
-  
-  @@_items = {}
-
-  @sdd_db           = "evesdd_galatea"
-  @sdd_db_table     = "invtypes"
+  attr_accessor   :volume, :href
+  @data = {}  ### Item[] datastore
   @sdd_db_fieldmap  = {"typeID"=>:id, "typeName"=>:name, "volume"=>:volume}
-
-  def self.[](id)
-    _load_db(@@_items)
-    @@_items[id]
-  end
-
-  ### add() - used for "new" items that are in Crest but not SDD (e.g., new skins)
-  def self.add(item)
-    _load_db(@@_items)
-    @@_items[item.id] = item
-  end
+  @sdd_db_table     = "invtypes"
+  @sdd_db           = "evesdd_galatea"
 end
 ### Item test cases
 id = 28272
@@ -209,10 +194,7 @@ assert_eq(Item[id].volume, vol, "item DB: volume info failed")
 assert_eq(Item[name].id, id, "item DB: name lookup failed")
 
 
-### Station class - singleton class for station data 
-###   pulls data from: 
-###   (a) EVE static data - id, name, region_id
-###   (b) CREST - href
+### Station class - wrapper class for station data 
 ### usage
 ###   Station[id].field
 ###   Station[name].field
@@ -223,31 +205,15 @@ assert_eq(Item[name].id, id, "item DB: name lookup failed")
 ###   region_id
 ###   system_id (solar system)
 class Station < Datum
- ### instance
-  attr_accessor  :id, :name, :sname, :href, :region_id, :system_id
+  attr_accessor  :sname, :href, :region_id, :system_id
   def initialize(fields={})
-    fields.each { |k,v| instance_variable_set("@#{k}", v) }
-    if @name then @sname = @name[0, @name.index(' ')] end
+    super(fields)
+    if @name then @sname = @name[0, @name.index(' ')] end  ### shortname
   end
-
-  ###
-  ### class
-  ###
-  
-  @@_stations = Hash.new  ### main datastore
+  @data = Hash.new  ### class singleton datastore
   @sdd_db           = "evesdd_galatea"
   @sdd_db_table     = "stastations"
   @sdd_db_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
-  
-  def self.[](id)
-    _load_db(@@_stations)
-    @@_stations[id]
-  end
-  
-  def self.each
-    _load_db(@@_stations)
-    @@_stations.values.uniq.each { |v| yield(v.id, v) }  ### filter out dup index
-  end  
 end
 ### Station test cases
 id = 60000004
@@ -258,8 +224,7 @@ assert_eq(Station[id].region_id, region, "station DB: region info failed")
 assert_eq(Station[name].id, id, "station DB: name lookup failed")
 
 
-### Region: singleton class for region data
-### NOTE: Region objects can be indexed through singleton datastore
+### Region: wrapper class for region data
 ### usage
 ###   Region[id].field
 ###   Region[name].field
@@ -271,28 +236,11 @@ assert_eq(Station[name].id, id, "station DB: name lookup failed")
 ###   buy_href      Crest URI base for market buy orders
 ###   sell_href     Crest URI base for market sell orders
 class Region < Datum
-  ### instance
-  attr_accessor   :id, :name, :href, :buy_href, :sell_href
-
-  ### class
-  @@_regions = Hash.new  ### singleton datastore
+  attr_accessor   :href, :buy_href, :sell_href
+  @data = Hash.new  ### class singleton datastore
   @sdd_db           = "evesdd_galatea"
   @sdd_db_table     = "mapregions"
-  @sdd_db_fieldmap  = {"regionID"=>:id, "regionName"=>:name}
-  
-  def self.[](id)
-    _load_db(@@_regions)
-    @@_regions[id]
-  end
-  
-  def self.[]=(id, rval)
-    _load_db(@@_regions)
-    @@_regions[id] = rval
-  end
-  
-  def self.each   ### filter out duplicate index
-    @@_regions.values.uniq.each { |v| yield(v.id, v) }  ### filter out dup index
-  end
+  @sdd_db_fieldmap  = {"regionID"=>:id, "regionName"=>:name}  
 end
 ### Region[]: add index by Station id
 Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}
@@ -944,7 +892,7 @@ class Crest < Source
     items = get_href_as_items(_href_item_types)
     items.each do |i|
       id = i["type"]["id"]
-      if not Item[id] then Item.add(Item.new({id:id, name:i["type"]["name"], volume: 1.0})) end
+      if not Item[id] then Item[id] = Item.new({id:id, name:i["type"]["name"], volume: 1.0}) end
       Item[id].href = i["type"]["href"]
       assert_eq(Item[id].name, i["type"]["name"], "item DB mismatch name")  ### test
     end
