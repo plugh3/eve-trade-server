@@ -159,7 +159,7 @@ end
 ### Datum -- base wrapper class for Eve game data
 ### subclassed for each data type (Item, Region, Station)
 ### each instance is a single data element
-### for DB compatibility, each instance has a unique ID and can be accessed by indexing into the class name as a hash
+### for DB compatibility, each instance has a unique ID and can be accessed by using the class as a hash
 ###   Item[id]
 ###   Region[name]  (sometimes duplicate indexed)
 ###   Station.each
@@ -168,6 +168,7 @@ class Datum
   
   def self.[](id)
     @data[id]
+    #puts self
   end
   
   def self.[]=(id, rval)
@@ -1365,13 +1366,19 @@ end
 
 
 
-class Trade
+class Trade < Datum
   attr_accessor :id, :db_id
   attr_accessor :from_stn, :to_stn, :item, :bids, :asks
   attr_accessor :qty, :profit, :cost, :age, :size, :ppv, :roi
+
   @@uid = 1
-  K_SUM = 'totals'
   
+  @data = {}
+  K_SUM = 'totals'
+  def self.each
+    @data.values.uniq.each { |v| yield(v.id, v) unless v.item == K_SUM }  ### filter out duplicate indexes
+  end  
+
   def initialize(fields={})
     ### primary
     @qty = 0
@@ -1384,7 +1391,7 @@ class Trade
     @roi = 0.0
     ### db
     @id = @@uid; @@uid+=1
-    fields.each { |k,v| instance_variable_set("@#{k}", v) }
+    super(fields)
   end
 
   def +(other)
@@ -1398,7 +1405,6 @@ class Trade
     self2
   end
 
-  ### SQL conversion
   def self.export_sql_hdr
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
@@ -1464,9 +1470,10 @@ def calc_trades(candidates)
     from = Region[from_stn].id
     to = Region[to_stn].id
     rt = "#{from_stn}:#{to_stn}"
-    trades[rt]        ||= {}
+    trades[rt]               ||= {}
     trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:Trade::K_SUM})
-    trades[rt][iid]   ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:iid})
+    trades[rt][iid]          ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:iid})
+    Trade[trades[rt][iid].id] = trades[rt][iid]  ### save to datastore
     trades[rt][iid].asks = $markets[from][iid].sell_orders
     trades[rt][iid].bids = $markets[to][iid].buy_orders
     trades[rt][iid].age = [$markets[from][iid].sell_sampled, $markets[to][iid].buy_sampled].max  ### most recent
@@ -1581,18 +1588,20 @@ class WheatDB
     ### insert new rows
     timer = Time.now
     q_orders = SqlInsertQ.new(@db, "orders", Order.export_sql_hdr)
-    orders_by_id.each_value do |o| q_orders << o.export_sql end
+    #orders_by_id.each_value do |o| q_orders << o.export_sql end
+    Order.each do |id, o| q_orders << o.export_sql end
     q_orders.flush
     puts "INSERT orders #{Time.now - timer}s"
 
     ### extract db_ids
     ### TODO: get rid of this
     o_results = @db.query("SELECT id, order_id FROM `orders`")
-    o_results.each do |row| orders_by_id[row["order_id"]].db_id = row["id"] end
+    o_results.each do |row| Order[row["order_id"]].db_id = row["id"] end
   end
   
   def export_trades(trades)
     trades_by_id = {}
+    ### filter out K_SUM Trades
     trades.each do |r, trades_by_item|
       trades_by_item.each do |i, t|
         next if i == Trade::K_SUM 
@@ -1605,13 +1614,14 @@ class WheatDB
     ### insert new rows
     timer = Time.now
     q_trades = SqlInsertQ.new(@db, "trades", Trade.export_sql_hdr)
-    trades_by_id.each_value do |t| q_trades << t.export_sql end
+    #trades_by_id.each_value do |t| q_trades << t.export_sql end
+    Trade.each do |id, t| q_trades << t.export_sql end
     q_trades.flush
     puts "INSERT trades #{Time.now - timer}s"
 
     ### extract db_ids
     t_results = @db.query("SELECT id, trade_id FROM `trades`")
-    t_results.each do |row| trades_by_id[row["trade_id"]].db_id = row["id"] end
+    t_results.each do |row| Trade[row["trade_id"]].db_id = row["id"] end
 
     trades_by_id
   end
@@ -1624,7 +1634,7 @@ class WheatDB
     ### insert new rows
     timer = Time.now
     q = SqlInsertQ.new(@db, "orders_trades", "(order_id, trade_id)")
-    trades_by_id.each do |tid, t|
+    Trade.each do |tid, t|
       t.asks.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
       t.bids.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
     end
