@@ -1,4 +1,5 @@
 require 'typhoeus'
+require 'typhoeus'
 require 'mysql2'
 require 'json'
 require 'base64'
@@ -72,25 +73,30 @@ class Mymysql < Mysql2::Client
   end
 end
 
-### SqlInsertQ class -- aggregate SQL INSERTs
+### SqlQueue class -- aggregate SQL INSERTs
 ### public methods
-###   new     -- set db, table, and field names
-###   <<      -- add line of values to query (auto-submits if max exceeded)
-###   flush() -- submit query
-class SqlInsertQ
+###   new_insert  -- set db, table, and field names
+###   <<          -- add line to query (auto-submits if max exceeded)
+###   flush()     -- submit query
+class SqlQueue
   SQL_MAX_ADJUST = 2
   #SQL_MAX = 1_048_576 - SQL_MAX_ADJUST
   SQL_HDR = "\n  "
   SQL_EOL = ", "
   SQL_EOF = ";"
 
-  def initialize(db, table, field_names)
+  def initialize(db, sql_base)
     @db = db
-    @sql_base = "INSERT INTO `#{table}` \n  #{field_names} \nVALUES "
+    @sql_base = sql_base
     @sql = @sql_base.dup
     ### query max packet size
     r = @db.query("SHOW variables LIKE 'max_allowed_packet';")
     r.each do |row| @sql_max = (row["Value"].to_i - SQL_MAX_ADJUST) if row["Variable_name"] == 'max_allowed_packet' end
+  end
+
+  def self.new_insert(db, table, field_names)
+    sql_base = "INSERT INTO `#{table}` \n  #{field_names} \nVALUES "
+    SqlQueue.new(db, sql_base)
   end
   
   def <<(vals)
@@ -101,7 +107,7 @@ class SqlInsertQ
   def flush
     @sql.chomp!(SQL_EOL)
     @sql << SQL_EOF
-    #puts "Sql.flush #{@sql.size} #{'%+i' % (@sql.size - SQL_MAX)}"
+    #puts "Sql.flush #{@sql.size} #{'%+i' % (@sql.size - @sql_max)}"
     @db.query(@sql)
     @sql = @sql_base.dup  # reset
   end
@@ -168,7 +174,6 @@ class Datum
   
   def self.[](id)
     @data[id]
-    #puts self
   end
   
   def self.[]=(id, rval)
@@ -177,14 +182,27 @@ class Datum
   
   def self.each
     @data.values.uniq.each { |v| yield(v.id, v) }  ### filter out duplicate indexes
-  end  
+  end
+
+  def self.delete(id)
+    @data.delete(id)
+  end
+  
+  def self.export_sql_table(db, db_table)
+    #db_name, db_table = db_id.split(".")
+    #db = Mymysql.new(db_name)
+    ### wipe table
+    db.query("DELETE FROM `#{db_table}`;")
+    ### insert new rows
+    q = SqlQueue.new_insert(db, db_table, self.export_sql_hdr)
+    self.each do |id, x| q << x.export_sql end
+    q.flush
+    puts "INSERT #{db_table}"
+  end
 end
 
 
 ### Item class - wrapper class for Eve item data 
-### usage
-###   Item[id].field
-###   Item[name].field
 ### fields
 ###   id
 ###   name
@@ -200,11 +218,7 @@ class Item < Datum
 end
 
 
-
 ### Station class - wrapper class for Eve station data 
-### usage
-###   Station[id].field
-###   Station[name].field
 ### fields
 ###   id
 ###   name
@@ -225,13 +239,8 @@ class Station < Datum
 end
 
 
-
 ### Region: wrapper class for Eve region data
-### usage
-###   Region[id].field
-###   Region[name].field
-###   Region[station_id].field
-### instance fields
+### fields
 ###   id
 ###   name
 ###   href          Crest URI for region
@@ -348,6 +357,7 @@ $markets = Hash.new {|h1,region| h1[region] = Hash.new {|h2,item| h2[item] = Mar
 ### methods
 ###   get(key)
 ###   set(key, val, time)
+###   ttl() -- defines cache policy based on key type
 ### usage
 ###   _cache[k] = [v, expire]
 ###   v = Response.body
@@ -1486,7 +1496,7 @@ def calc_trades(candidates)
 
   ### match bids/asks
   ### iterate through all trades[route][item]
-  puts "\n------------\n"
+  puts "------------\n"
   trades.each_key do |rt| 
     from_stn, to_stn = rt.split(':')
     from_stn = from_stn.to_i
@@ -1519,7 +1529,7 @@ def calc_trades(candidates)
         t.qty += qty
         t.cost += qty * ask.price
       end  ### match bids/asks
-      if (i_ask == 0 and i_bid == 0) then trades[rt].delete(iid); next end ### no matches
+      if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(iid); next end ### no matches
 
       ### derived calcs
       t.size = t.qty * Item[iid].volume
@@ -1527,9 +1537,9 @@ def calc_trades(candidates)
       t.roi = t.profit / t.cost
 
       ### skip? check profit thresholds, known scams, etc.
-      if t.profit < min_total_profit  then trades[rt].delete(iid); next end
-      if t.ppv < min_ppv              then trades[rt].delete(iid); next end
-      if t.suspicious                 then trades[rt].delete(iid); next end
+      if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(iid); next end
+      if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(iid); next end
+      if t.suspicious                 then Trade.delete(t.id); trades[rt].delete(iid); next end
       
       ### flag unprofitable orders
       ### loop exits on (a) first unprofitable match or (b) ran out of bids or asks
@@ -1569,79 +1579,35 @@ end
 
 class WheatDB
   def initialize(db_name)
+    @db_name = db_name
     @db = Mymysql.new(db_name)
   end
 
-  ### in: Markets[]
-  ### out: n/a
-  ### TODO: make Orders[] class datastore indexed by id
+  ### TODO: refactor $markets
   def export_orders(markets)
-    orders_by_id = {}
-    markets.each_key do |reg|
-      markets[reg].each_key do |iid|
-        markets[reg][iid].buy_orders.each  do |o| orders_by_id[o.id] = o end
-        markets[reg][iid].sell_orders.each do |o| orders_by_id[o.id] = o end
-      end
-    end
-    ### wipe table
-    @db.query("DELETE FROM `orders`;")
-    ### insert new rows
-    timer = Time.now
-    q_orders = SqlInsertQ.new(@db, "orders", Order.export_sql_hdr)
-    #orders_by_id.each_value do |o| q_orders << o.export_sql end
-    Order.each do |id, o| q_orders << o.export_sql end
-    q_orders.flush
-    puts "INSERT orders #{Time.now - timer}s"
-
-    ### extract db_ids
-    ### TODO: get rid of this
-    o_results = @db.query("SELECT id, order_id FROM `orders`")
-    o_results.each do |row| Order[row["order_id"]].db_id = row["id"] end
+    Order.export_sql_table(@db, "orders")
   end
   
-  def export_trades(trades)
-    trades_by_id = {}
-    ### filter out K_SUM Trades
-    trades.each do |r, trades_by_item|
-      trades_by_item.each do |i, t|
-        next if i == Trade::K_SUM 
-        trades_by_id[t.id] = t
-      end
-    end
-    
-    ### wipe table
-    @db.query("DELETE FROM `trades`;")
-    ### insert new rows
-    timer = Time.now
-    q_trades = SqlInsertQ.new(@db, "trades", Trade.export_sql_hdr)
-    #trades_by_id.each_value do |t| q_trades << t.export_sql end
-    Trade.each do |id, t| q_trades << t.export_sql end
-    q_trades.flush
-    puts "INSERT trades #{Time.now - timer}s"
-
-    ### extract db_ids
-    t_results = @db.query("SELECT id, trade_id FROM `trades`")
-    t_results.each do |row| Trade[row["trade_id"]].db_id = row["id"] end
-
-    trades_by_id
+  def export_trades
+    Trade.export_sql_table(@db, "trades")
   end
   
-  ### DB: orders <-> trades table (trades_by_id)
-  ### in: trades_by_id
-  def export_orders_trades(trades_by_id)
+  def export_orders_trades
+    start = Time.now
     ### wipe table
     @db.query("DELETE FROM `orders_trades`;")
+    #puts "DELETE orders_trades #{Time.now - start}s"
     ### insert new rows
-    timer = Time.now
-    q = SqlInsertQ.new(@db, "orders_trades", "(order_id, trade_id)")
+    q = SqlQueue.new_insert(@db, "orders_trades", "(order_id, trade_id)")
     Trade.each do |tid, t|
-      t.asks.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
-      t.bids.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
+      t.asks.each do |o| q << "(#{o.id}, #{t.id})" end
+      t.bids.each do |o| q << "(#{o.id}, #{t.id})" end
     end
     q.flush
-    puts "INSERT orders_trades #{Time.now - timer}s"
+    puts "INSERT orders_trades #{Time.now - start}s"
   end
 end
+
 
 Cache.restore
 ### main loop
@@ -1657,13 +1623,14 @@ while 1
   trades = calc_trades(candidates)        # confirm trades against fresh market data
 
   ### export to DB: orders, trades, orders_trades
+	STDERR.puts "------------\n"
   db2 = WheatDB.new("wheat_development")
   db2.export_orders($markets)
-  trades_by_id = db2.export_trades(trades)
-  db2.export_orders_trades(trades_by_id)
+  db2.export_trades
+  db2.export_orders_trades
 
-
-	STDERR.puts "\n------------\n"
+  ### runtime stats
+	STDERR.puts "------------\n"
   puts "full loop: #{Time.now - $timers[:main]}s"
   size = $counters[:size]; $counters[:size] = 0;
   #puts "cache size:   #{'%.1f' % (Cache.size/1_000_000.0)}MB, #{Cache.length} entries, #{'%.1f' % (Cache.biggest/1_000.0)}KB max"
