@@ -74,7 +74,8 @@ end
 
 ### SqlInsertQ class -- aggregate SQL INSERTs
 ### public methods
-###   <<      -- add line of values to query
+###   new     -- set db, table, and field names
+###   <<      -- add line of values to query (auto-submits if max exceeded)
 ###   flush() -- submit query
 class SqlInsertQ
   SQL_MAX_ADJUST = 2
@@ -120,8 +121,8 @@ SDD_DB_NAME = "evesdd_galatea"
 def import_sdd(db_table, fieldmap, klass, dst_store) 
   # skip if already loaded
   if dst_store.size == 0 then
+    print "loading DB \"#{SDD_DB_NAME}.#{db_table}\"..."
     start = Time.now
-    print "loading DB \"sdd.#{db_table}\"..."
 
     ### query db
     db_name = SDD_DB_NAME
@@ -158,10 +159,9 @@ end
 ### Datum -- base wrapper class for Eve game data
 ### subclassed for each data type (Item, Region, Station)
 ### each instance is a single data element
-### all instances are saved in the main datastore indexed by id and name
-### datastore is accessed by indexing into the class itself as a hash
+### for DB compatibility, each instance has a unique ID and can be accessed by indexing into the class name as a hash
 ###   Item[id]
-###   Region[name] 
+###   Region[name]  (sometimes duplicate indexed)
 ###   Station.each
 class Datum
   include InitByHash
@@ -180,7 +180,7 @@ class Datum
 end
 
 
-### Item class - wrapper class for item data 
+### Item class - wrapper class for Eve item data 
 ### usage
 ###   Item[id].field
 ###   Item[name].field
@@ -200,7 +200,7 @@ end
 
 
 
-### Station class - wrapper class for station data 
+### Station class - wrapper class for Eve station data 
 ### usage
 ###   Station[id].field
 ###   Station[name].field
@@ -218,7 +218,6 @@ class Station < Datum
   end
 
   @data = {}        ### Station[] datastore
-  @sdd_db           = "evesdd_galatea"
   @sdd_db_table     = "stastations"
   @sdd_db_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
   import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
@@ -226,7 +225,7 @@ end
 
 
 
-### Region: wrapper class for region data
+### Region: wrapper class for Eve region data
 ### usage
 ###   Region[id].field
 ###   Region[name].field
@@ -241,7 +240,6 @@ class Region < Datum
   attr_accessor :id, :name, :href, :buy_href, :sell_href
   
   @data = {}        ### Region[] datastore
-  @sdd_db           = "evesdd_galatea"
   @sdd_db_table     = "mapregions"
   @sdd_db_fieldmap  = {"regionID"=>:id, "regionName"=>:name}  
   import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
@@ -277,7 +275,6 @@ assert_eq(Region[name].id, id, "region DB: name lookup failed")
 ### Order class - EVE market order
 ### NOTE: data source could be Crest or Marketlogs
 class Order < Datum
-  include InitByHash
   attr_accessor \
     :id, :db_id, \
     :item_id, :buy, :price, \
@@ -286,16 +283,37 @@ class Order < Datum
     :issued, :duration, :sampled, \
     :ignore
 
+  @data = {}    ### Order[] datastore
+  
+  def self.import_crest(i, sampled = Time.new(0))
+    o = Order.new({
+      :id         => i["id"],
+      :item_id    => i["type"]["id"],
+      :buy        => i["buy"],
+      :price      => i["price"].to_f,
+      :vol_rem    => i["volume"],
+      :vol_orig   => i["volumeEntered"],
+      :vol_min    => i["minVolume"],
+      :station_id => i["location"]["id"],
+      :range      => i["range"],
+      :region_id  => Station[i["location"]["id"]].region_id,
+      :issued     => DateTime.strptime(i["issued"], '%Y-%m-%dT%H:%M:%S').to_time.getutc,
+      :duration   => i["duration"],
+      :sampled    => sampled,
+    })
+    Order[o.id] = o
+    o
+  end
+
   def to_s
     (buy ? 'bid' : 'ask') + " #{'%17s' % (comma(price, '$'))} #{'%7s' % (comma_i(vol_rem, 'x'))}" + (vol_min > 1 ? " (_#{vol_min})" : "")
   end
 
-  ### SQL conversion
-  def self.to_sql_hdr
+  def self.export_sql_hdr
     "(order_id, station_id, region_id, item_id, buy, price, price_str, vol, vol_str, ignored)"
   end
-  def to_sql
-    "(#{id}, #{station_id}, #{region_id}, #{item_id}, #{buy}, #{price}, '#{comma(price, "$")}', #{vol_rem}, '#{comma_i vol_rem}', #{ignore ? 'true' : 'false'})"
+  def export_sql
+    "(#{id}, #{station_id}, #{region_id}, #{item_id}, #{buy}, #{price}, '#{comma(price, '$')}', #{vol_rem}, '#{comma_i vol_rem}', #{ignore ? 'true' : 'false'})"
   end
 end
 
@@ -345,16 +363,14 @@ class Cache
   def self.get(k, now=Time.now)
     v, exp = @@_cache[k]
     if v and now < exp
-=begin
-      puts "    cache hit #{Crest.pretty k}" if k.match("^#{Crest.re_root}$")
-      puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_auth)
+      #puts "    cache hit #{Crest.pretty k}" if k.match("^#{Crest.re_root}$")
+      #puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_auth)
       #puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_market)
       #puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/")
-      puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/.page=12")
-      puts "    cache hit #{Crest.pretty k}" if k.match("/regions/$")
-      puts "    cache hit #{Crest.pretty k}" if k.match("/regions/10000001")
+      #puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/.page=12")
+      #puts "    cache hit #{Crest.pretty k}" if k.match("/regions/$")
+      #puts "    cache hit #{Crest.pretty k}" if k.match("/regions/10000001")
       puts "    cache hit #{Crest.pretty k}" if k.match(Evecentral.url_base)
-=end
       @@_hits += 1
       ### access token response is cached with relative "expires_in" value, so adjust to actual TTL
       if k.match(Crest.re_auth) then
@@ -362,6 +378,8 @@ class Cache
         jhash["expires_in"] = exp - now
         v = JSON.generate(jhash)
         @@_cache[k] = [v, exp]
+      elsif k.match(Evecentral.url_base)
+        @@_cache.delete(k)  ### eve-central.com expires after 1 cache get (for prefetch)
       end
       v
     else
@@ -406,6 +424,9 @@ class Cache
   def self.hits
     @@_hits
   end
+  def self.hits=(rval)
+    @@_hits
+  end
   def self.size
     size = 0;
     @@_cache.each do |k, x| size += k.size + x[0].size + x[1].inspect.size end
@@ -435,12 +456,11 @@ class Cache
     elsif url.match("/market/types/") or url.match("/regions/") or url.match("^#{Crest.re_root}$")
       ret = 60*60
     elsif url.match(Evecentral.url_base) 
-      ret = 30  ### just enough for prefetch results to carryover to actual fetch (not saved to cache file)
+      ret = 60  ### just enough for prefetch to carryover to actual fetch
+    ### server-defined TTLs
     elsif url.match(Crest.re_auth) 
-      # server-defined
       ret = (JSON.parse(response.body))["expires_in"] 
     elsif hdr["Cache-Control"] and hdr["Cache-Control"].match("max-age=([0-9]+)")
-      # server-defined
       ret = $1.to_i
     end
 
@@ -709,7 +729,7 @@ end ### class Evecentral
 
 ### Crest - wrapper class for pulling market data from CCP authenticated CREST
 ### public interface
-###   get_trades
+###   import_orders
 class Crest < Source
   URI_ROOT = 'https://crest-tq.eveonline.com/'
   URI_PATH_ITEMTYPES  = 'marketTypes'   ### "/marketTypes/"
@@ -938,7 +958,7 @@ class Crest < Source
   
   ### converts Crest market order "item" to Order object
   def self.import_crest_order(i, sampled = Time.new(0))
-    Order.new({
+    o = Order.new({
       :id         => i["id"],
       :item_id    => i["type"]["id"],
       :buy        => i["buy"],
@@ -953,6 +973,8 @@ class Crest < Source
       :duration   => i["duration"],
       :sampled    => sampled,
     })
+    Order[o.id] = o
+    o
   end
 
   ### get_market_orders() - returns href and callback for market order fetch
@@ -985,9 +1007,9 @@ class Crest < Source
     _get_market_orders(from, item, now, false)
   end
 
-  ### get_trades() - fetch market orders; populate $markets[region][item].buy_orders
-  def self.get_trades(trades)
-    #puts "Crest.get_trades()"
+  ### import_orders() - fetch market orders; populate $markets[region][item].buy_orders
+  def self.import_orders(trades)
+    #puts "Crest.import_orders()"
     hrefs = []
     procs = {}
     now = Time.now.getutc
@@ -1034,12 +1056,12 @@ class Marketlogs < Source
     [region_id, item_id, sample_time]
   end
 
-  ### line2order() - converts marketlog row into Order object
-  def self.line2order(line, sample_time=Time.new(0))
+  ### import_line() - converts marketlog row into Order object
+  def self.import_line(line, sample_time=Time.new(0))
     price, vol_rem, item_id, range, order_id, vol_orig, vol_min, \
       buy, issued, duration, station_id, region_id, system_id, jumps \
       = line.split(',')
-    Order.new({
+    o = Order.new({
       :id         => order_id.to_i, 
       :item_id    => item_id.to_i, 
       :buy        => (buy == "True"), 
@@ -1054,24 +1076,26 @@ class Marketlogs < Source
       :duration   => duration.to_i, 
       :sampled    => sample_time,
     })
+    Order[o.id] = o
+    o
   end
   
-  def self.file2orders(fname)
+  def self.import_file(fname)
     region_id, item_id, sample_time = file_attrs(fname)
     file = File.new(fname, "r")
     file.gets   ### header line
     #header = "price,volRemaining,typeID,range,orderID,volEntered,minVolume,bid,issueDate,duration,stationID,regionID,solarSystemID,jumps,"
     orders = []
     while line = file.gets
-      orders << line2order(line, sample_time)
+      orders << import_line(line, sample_time)
     end
     file.close
     orders
   end
   ### test
-  #assert_eq(item_id,   order.item_id,   "Marketlogs.file2orders() item mismatch")
-  #assert_eq(region_id, order.region_id, "Marketlogs.file2orders() region mismatch")
-  #assert_eq(region_id, Station[order.station_id].region_id, "Marketlogs.file2orders() station-region mismatch")      
+  #assert_eq(item_id,   order.item_id,   "Marketlogs.import_file() item mismatch")
+  #assert_eq(region_id, order.region_id, "Marketlogs.import_file() region mismatch")
+  #assert_eq(region_id, Station[order.station_id].region_id, "Marketlogs.import_file() station-region mismatch")      
 
   EXPORT_DIR = "C:\\Users\\csserra\\Documents\\EVE\\logs\\Marketlogs\\"
   EXPORT_TTL = 3*24*60*60 # delete after 3 days
@@ -1109,9 +1133,9 @@ class Marketlogs < Source
     end
   end
   
-  ### get_all() - check all marketlog files, import if more recent
-  def self.get_all
-    #puts "Marketlogs.get_all()"
+  ### import_orders() - check all marketlog files, import if more recent
+  def self.import_orders
+    #puts "Marketlogs.import_orders()"
     ### call this every 2 sec
     purge_old
     update = false
@@ -1126,7 +1150,7 @@ class Marketlogs < Source
       buy_sampled = mkt.buy_sampled
       sell_sampled = mkt.sell_sampled
       if (f_sampled > buy_sampled or f_sampled > sell_sampled) then
-        orders = Marketlogs.file2orders(fname)
+        orders = Marketlogs.import_file(fname)
         if f_sampled > buy_sampled then
           puts ">>> file buy  #{'%11s' % Region[region_id].name}::#{Item[item_id].name}"
           mkt.buy_orders  = orders.select { |x| x.buy }
@@ -1178,7 +1202,7 @@ def prefetch
   ###
   ### Phase 1
   ###
-  mget_q = []
+  mget_q = []   ### aggregate mget requests
   ### Phase 1: Crest access token
   url = "https://login-tq.eveonline.com/oauth/token/"
   opt = Crest.refresh_atoken_opts
@@ -1334,7 +1358,7 @@ def prefetch
   ### Phase 2: mget
   _prefetch_mget(mget_q)
 
-  puts ">>> prefetch time #{Time.now - prefetch_start}"
+  puts "prefetch #{Time.now - prefetch_start}s"
 end
 
 
@@ -1346,6 +1370,7 @@ class Trade
   attr_accessor :from_stn, :to_stn, :item, :bids, :asks
   attr_accessor :qty, :profit, :cost, :age, :size, :ppv, :roi
   @@uid = 1
+  K_SUM = 'totals'
   
   def initialize(fields={})
     ### primary
@@ -1374,10 +1399,10 @@ class Trade
   end
 
   ### SQL conversion
-  def self.to_sql_hdr
+  def self.export_sql_hdr
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
-  def to_sql
+  def export_sql
     itemname_esc = Mysql2::Client.escape(Item[item].name)
     "(#{id}, '#{Station[from_stn].sname}', '#{Station[to_stn].sname}', '#{itemname_esc}', #{qty}, #{profit}, #{cost}, #{size}, #{ppv}, #{roi})"
   end
@@ -1418,28 +1443,10 @@ class Trade
 end   ### Trade class
 
 
-
-### main loop
-while 1
-
-  $timers[:main] = Time.now
-  Cache.restore
-  prefetch
-  Cache.save
-
-  ### get trade candidates
-  candidates = Evecentral.get_profitables   ### returns 3-tuple [from_stn, to_stn, item] 
-
-  ### get market orders
-  Crest.get_trades(candidates)  
-  Marketlogs.get_all
-  Cache.save
-
-  
-  puts "\n------------\n"
-  
-  
-  ### calculate trades
+### find profitable trades
+### in: $markets, candidates
+### out: trades
+def calc_trades(candidates)
   ### sort orders by price
   $markets.each_key do |reg|
     $markets[reg].each_key do |i|
@@ -1450,40 +1457,38 @@ while 1
     end
   end
   
-  ### trades{route}{item} => Trade
-  k_sum = 'totals'
-  trades = {}   ### trades{route_id}{item} => Trade
+  trades = {} ### trades{route_id}{item}  => item
+              ### trades{route_id}{Trade::K_SUM} => route totals
   candidates.each do |tuple|
     from_stn, to_stn, iid = tuple
     from = Region[from_stn].id
     to = Region[to_stn].id
     rt = "#{from_stn}:#{to_stn}"
     trades[rt]        ||= {}
-    trades[rt][k_sum] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:k_sum})
+    trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:Trade::K_SUM})
     trades[rt][iid]   ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:iid})
     trades[rt][iid].asks = $markets[from][iid].sell_orders
     trades[rt][iid].bids = $markets[to][iid].buy_orders
     trades[rt][iid].age = [$markets[from][iid].sell_sampled, $markets[to][iid].buy_sampled].max  ### most recent
   end
 
-  #trades.each_key.sort do |k| trades[k] end
-  
   net_tax = 0.9925  ### Accounting V
   min_profit = 1
   min_ppv = 1_000
   min_total_profit = 3_000_000
-  
+
+  ### match bids/asks
   ### iterate through all trades[route][item]
+  puts "\n------------\n"
   trades.each_key do |rt| 
     from_stn, to_stn = rt.split(':')
     from_stn = from_stn.to_i
     to_stn = to_stn.to_i
     trades[rt].each do |iid, t|
-      next if iid == k_sum
+      next if iid == Trade::K_SUM
       asks = t.asks
       bids = t.bids   
 
-      ### match profitable bids and asks
       i_ask = 0
       i_bid = 0
       ask_vol = 0
@@ -1530,19 +1535,19 @@ while 1
       (i_ask...asks.size).each {|x| asks[x].ignore = true}
       (i_bid...bids.size).each {|x| bids[x].ignore = true}
 
-      ### add to route subtotals
-      trades[rt][k_sum] += t
-      
-    end  ### each trade
+      ### add to route totals
+      trades[rt][Trade::K_SUM] += t
+    end  ### each trade[rt][item]
 
+    ### print routes
     puts "#{Station[from_stn].sname} -> #{Station[to_stn].sname}"
-    sum = trades[rt][k_sum]
-    puts "=> $#{comma(sum.profit / 1_000_000.0)}M total, #{comma_i sum.size.to_i} m3"
+    totals = trades[rt][Trade::K_SUM]
+    puts "=> $#{comma(totals.profit / 1_000_000.0)}M total, #{comma_i totals.size.to_i} m3"
     
     ### sort most profitable first
     sorted = trades[rt].values.sort do |a,b| b.profit <=> a.profit end 
     sorted.each do |t| 
-      next if t.item == k_sum 
+      next if t.item == Trade::K_SUM 
       puts "  $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
       if t.profit > 100_000_000
         t.asks.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
@@ -1550,77 +1555,106 @@ while 1
         t.bids.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
       end
     end
+    end  ### trades[route]
+
+    trades
+end
+
+class WheatDB
+  def initialize(db_name)
+    @db = Mymysql.new(db_name)
   end
-  
 
-
-  ###
-  ### store to DB: orders, trades, orders_trades
-  ###
-  
-  ### save to db
-  db = Mymysql.new("wheat_development")
-
-  ### DB: orders
-  orders_by_id = {}
-  $markets.each_key do |reg|
-    $markets[reg].each_key do |iid|
-      $markets[reg][iid].buy_orders.each  do |o| orders_by_id[o.id] = o end
-      $markets[reg][iid].sell_orders.each do |o| orders_by_id[o.id] = o end
+  ### in: Markets[]
+  ### out: n/a
+  ### TODO: make Orders[] class datastore indexed by id
+  def export_orders(markets)
+    orders_by_id = {}
+    markets.each_key do |reg|
+      markets[reg].each_key do |iid|
+        markets[reg][iid].buy_orders.each  do |o| orders_by_id[o.id] = o end
+        markets[reg][iid].sell_orders.each do |o| orders_by_id[o.id] = o end
+      end
     end
-  end
-  ### delete old db rows
-  db.query("DELETE FROM `orders`;")
-  puts "mysql DELETE orders"
-  ### insert new db rows
-  timer = Time.now
-  q_orders = SqlInsertQ.new(db, "orders", Order.to_sql_hdr)
-  orders_by_id.each_value do |o| q_orders << o.to_sql end
-  q_orders.flush
-  puts "mysql INSERT orders #{Time.now - timer}s"
-  ### db_ids
-  o_results = db.query("SELECT id, order_id FROM `orders`")
-  o_results.each do |row| orders_by_id[row["order_id"]].db_id = row["id"] end
+    ### wipe table
+    @db.query("DELETE FROM `orders`;")
+    ### insert new rows
+    timer = Time.now
+    q_orders = SqlInsertQ.new(@db, "orders", Order.export_sql_hdr)
+    orders_by_id.each_value do |o| q_orders << o.export_sql end
+    q_orders.flush
+    puts "INSERT orders #{Time.now - timer}s"
 
-  ### DB: trades
-  trades_by_id = {}
-  trades.each do |r, trades_by_item|
-    trades_by_item.each do |i, t|
-      next if i == k_sum 
-      trades_by_id[t.id] = t
-    end
+    ### extract db_ids
+    ### TODO: get rid of this
+    o_results = @db.query("SELECT id, order_id FROM `orders`")
+    o_results.each do |row| orders_by_id[row["order_id"]].db_id = row["id"] end
   end
-  ### delete old db rows
-  db.query("DELETE FROM `trades`;")
-  puts "mysql DELETE trades"
-  ### insert new db rows
-  timer = Time.now
-  q_trades = SqlInsertQ.new(db, "trades", Trade.to_sql_hdr)
-  trades_by_id.each_value do |t| q_trades << t.to_sql end
-  q_trades.flush
-  puts "mysql INSERT trades #{Time.now - timer}s"
-  ### db_ids
-  t_results = db.query("SELECT id, trade_id FROM `trades`")
-  t_results.each do |row| trades_by_id[row["trade_id"]].db_id = row["id"] end
-
-  ### DB: orders <-> trades table
-  ### delete old
-  db.query("DELETE FROM `orders_trades`;")
-  puts "mysql DELETE orders_trades"
-  ### insert new
-  timer = Time.now
-  q = SqlInsertQ.new(db, "orders_trades", "(order_id, trade_id)")
-  trades_by_id.each do |tid, t|
-    t.asks.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
-    t.bids.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
-  end
-  q.flush
-  puts "mysql INSERT orders_trades #{Time.now - timer}s"
   
+  def export_trades(trades)
+    trades_by_id = {}
+    trades.each do |r, trades_by_item|
+      trades_by_item.each do |i, t|
+        next if i == Trade::K_SUM 
+        trades_by_id[t.id] = t
+      end
+    end
+    
+    ### wipe table
+    @db.query("DELETE FROM `trades`;")
+    ### insert new rows
+    timer = Time.now
+    q_trades = SqlInsertQ.new(@db, "trades", Trade.export_sql_hdr)
+    trades_by_id.each_value do |t| q_trades << t.export_sql end
+    q_trades.flush
+    puts "INSERT trades #{Time.now - timer}s"
+
+    ### extract db_ids
+    t_results = @db.query("SELECT id, trade_id FROM `trades`")
+    t_results.each do |row| trades_by_id[row["trade_id"]].db_id = row["id"] end
+
+    trades_by_id
+  end
+  
+  ### DB: orders <-> trades table (trades_by_id)
+  ### in: trades_by_id
+  def export_orders_trades(trades_by_id)
+    ### wipe table
+    @db.query("DELETE FROM `orders_trades`;")
+    ### insert new rows
+    timer = Time.now
+    q = SqlInsertQ.new(@db, "orders_trades", "(order_id, trade_id)")
+    trades_by_id.each do |tid, t|
+      t.asks.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
+      t.bids.each do |o| q << "(#{o.db_id}, #{t.db_id})" end
+    end
+    q.flush
+    puts "INSERT orders_trades #{Time.now - timer}s"
+  end
+end
+
+Cache.restore
+### main loop
+while 1
+  $timers[:main] = Time.now
+  prefetch
+
+  candidates = Evecentral.get_profitables # returns 3-tuple [from_stn, to_stn, item] 
+  Crest.import_orders(candidates)         # populates $markets
+  Marketlogs.import_orders                # populates $markets
+  Cache.save
+
+  trades = calc_trades(candidates)        # confirm trades against fresh market data
+
+  ### export to DB: orders, trades, orders_trades
+  db2 = WheatDB.new("wheat_development")
+  db2.export_orders($markets)
+  trades_by_id = db2.export_trades(trades)
+  db2.export_orders_trades(trades_by_id)
+
 
 	STDERR.puts "\n------------\n"
   puts "full loop: #{Time.now - $timers[:main]}s"
-   
   size = $counters[:size]; $counters[:size] = 0;
   #puts "cache size:   #{'%.1f' % (Cache.size/1_000_000.0)}MB, #{Cache.length} entries, #{'%.1f' % (Cache.biggest/1_000.0)}KB max"
 	puts "overall downloaded: " + sprintf("%3.1f", size/1_000_000.0) + "MB"
@@ -1629,9 +1663,8 @@ while 1
 	puts "trades: #{$counters[:profitables]}" ; $counters[:profitables] = 0;
 	puts "parse time:   " + ("%.1f" % ($timers[:parse] * 1_000.0)) + "ms"; $timers[:parse] = 0
   gets = $counters[:get]
-  hits = Cache.hits
 	puts "GETs: #{gets}"
-	puts "cache hits: #{hits} (#{'%.1f' % (hits.to_f * 100.0 / (hits + gets))}%)"
+	puts "cache hits: #{Cache.hits} (#{'%.1f' % (Cache.hits.to_f * 100.0 / (Cache.hits + gets))}%)"; Cache.hits = 0
   $counters[:get] = 0;
 	STDERR.puts "------------\n"
 
