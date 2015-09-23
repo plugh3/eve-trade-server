@@ -77,7 +77,8 @@ end
 ###   <<      -- add line of values to query
 ###   flush() -- submit query
 class SqlInsertQ
-  SQL_MAX = 1_048_576
+  SQL_MAX_ADJUST = 2
+  #SQL_MAX = 1_048_576 - SQL_MAX_ADJUST
   SQL_HDR = "\n  "
   SQL_EOL = ", "
   SQL_EOF = ";"
@@ -86,36 +87,44 @@ class SqlInsertQ
     @db = db
     @sql_base = "INSERT INTO `#{table}` \n  #{field_names} \nVALUES "
     @sql = @sql_base.dup
+    ### query max packet size
+    r = @db.query("SHOW variables LIKE 'max_allowed_packet';")
+    r.each do |row| @sql_max = (row["Value"].to_i - SQL_MAX_ADJUST) if row["Variable_name"] == 'max_allowed_packet' end
   end
   
   def <<(vals)
-    if (@sql.size + SQL_HDR.size + vals.size + SQL_EOF.size) >= SQL_MAX then flush end
+    if (@sql.size + SQL_HDR.size + vals.size + SQL_EOF.size) > @sql_max then flush end
     @sql << SQL_HDR + vals + SQL_EOL
   end
   
   def flush
     @sql.chomp!(SQL_EOL)
     @sql << SQL_EOF
+    #puts "Sql.flush #{@sql.size} #{'%+i' % (@sql.size - SQL_MAX)}"
     @db.query(@sql)
-    @sql = @sql_base.dup  # reset queue
+    @sql = @sql_base.dup  # reset
   end
 end
 
-### load_db_sdd() - import DB rows into object hash using provided field mappings
-###   hash is dup-indexed by id and name
+
+
+### import_sdd() - import SDD DB rows into datastore according to field mappings
+###   hash is duplicate indexed by id and name
 ### args
-###   db_name: name of DB in mysql
-###   db_table: table in mysql
-###   dst_type: class name of object to be instantiated and stored in "dst_store" ["Item", "Station", "Region", etc.]
-###   dst_store: datastore hash
-###   fieldmap: "src=>dst" field mappings, for each field to be imported
-def load_db_sdd(db_name, db_table, dst_type, dst_store, fieldmap) 
+###   SDD_DB_NAME:  source DB
+###   db_table:     source DB table
+###   dst_type:     Class to be instantiated and stored in "dst_store" ["Item", "Station", "Region", etc.]
+###   dst_store:    datastore hash
+###   fieldmap:     src=>dst field mappings, for each field to be imported
+SDD_DB_NAME = "evesdd_galatea"
+def import_sdd(db_table, fieldmap, klass, dst_store) 
   # skip if already loaded
   if dst_store.size == 0 then
     start = Time.now
     print "loading DB \"sdd.#{db_table}\"..."
 
     ### query db
+    db_name = SDD_DB_NAME
     db = Mymysql.new(db_name)
     db_fields = fieldmap.keys.join(", ")
     sql = "SELECT #{db_fields} FROM #{db_table}"
@@ -123,49 +132,51 @@ def load_db_sdd(db_name, db_table, dst_type, dst_store, fieldmap)
 
     ### convert row
     results.each do |src_row|
-      # define fields and instantiate object
+      ### define fields and instantiate object
       dst_fields = {}
       fieldmap.each { |k_src, k_dst| dst_fields[k_dst] = src_row[k_src] }
-      klass = Object.const_get(dst_type)
-      x = klass.new(dst_fields)  ### used for Item, Station, Region, etc.
-      # save to datastore
+      #klass = Object.const_get(dst_type)  ### lookup constructor by class name
+      x = klass.new(dst_fields)
+      ### save to datastore
       dst_store[x.id] = x
-      dst_store[x.name] = x  ### duplicate index by name
+      dst_store[x.name] = x if x.name ### duplicate index by name
     end
     puts "done (#{sz dst_store}, #{Time.now - start} sec)"
   end
 end
 
 
-### Datum -- wrapper class for game data types in static data dump (SDD)
-### individual objects can be accessed via class methods: 
-###   [id]
-###   [name] 
-###   each
-### subclass for each data type
-class Datum
-  attr_reader :id, :name
-  @data = {}
+
+### InitByHash -- initialize() via hash of name-value pairs
+module InitByHash
   def initialize(fields={})
     fields.each { |k,v| instance_variable_set("@#{k}", v) }
   end
+end
 
+
+### Datum -- base wrapper class for Eve game data
+### subclassed for each data type (Item, Region, Station)
+### each instance is a single data element
+### all instances are saved in the main datastore indexed by id and name
+### datastore is accessed by indexing into the class itself as a hash
+###   Item[id]
+###   Region[name] 
+###   Station.each
+class Datum
+  include InitByHash
+  
   def self.[](id)
-    _load_db(@data)
     @data[id]
   end
+  
   def self.[]=(id, rval)
-    _load_db(@data)
     @data[id] = rval
   end
+  
   def self.each
-    _load_db(@data)
     @data.values.uniq.each { |v| yield(v.id, v) }  ### filter out duplicate indexes
   end  
-  
-  def self._load_db(datastore)
-    load_db_sdd(@sdd_db, @sdd_db_table, self.to_s, datastore, @sdd_db_fieldmap)
-  end
 end
 
 
@@ -179,19 +190,14 @@ end
 ###   volume
 ###   href
 class Item < Datum
-  attr_accessor   :volume, :href
-  @data = {}  ### Item[] datastore
-  @sdd_db_fieldmap  = {"typeID"=>:id, "typeName"=>:name, "volume"=>:volume}
+  attr_accessor :id, :name, :volume, :href
+
+  @data = {}        ### Item[] datastore
   @sdd_db_table     = "invtypes"
-  @sdd_db           = "evesdd_galatea"
+  @sdd_db_fieldmap  = {"typeID"=>:id, "typeName"=>:name, "volume"=>:volume}
+  import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
 end
-### Item test cases
-id = 28272
-vol = 10.0
-name = "'Augmented' Hammerhead"
-assert_eq(Item[id].name, name, "item DB: name info failed")
-assert_eq(Item[id].volume, vol, "item DB: volume info failed")
-assert_eq(Item[name].id, id, "item DB: name lookup failed")
+
 
 
 ### Station class - wrapper class for station data 
@@ -205,23 +211,19 @@ assert_eq(Item[name].id, id, "item DB: name lookup failed")
 ###   region_id
 ###   system_id (solar system)
 class Station < Datum
-  attr_accessor  :sname, :href, :region_id, :system_id
+  attr_accessor :id, :name, :sname, :href, :region_id, :system_id
   def initialize(fields={})
     super(fields)
     if @name then @sname = @name[0, @name.index(' ')] end  ### shortname
   end
-  @data = Hash.new  ### class singleton datastore
+
+  @data = {}        ### Station[] datastore
   @sdd_db           = "evesdd_galatea"
   @sdd_db_table     = "stastations"
   @sdd_db_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
+  import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
 end
-### Station test cases
-id = 60000004
-name = "Muvolailen X - Moon 3 - CBD Corporation Storage"
-region = 10000033
-assert_eq(Station[id].name, name, "station DB: name info failed")
-assert_eq(Station[id].region_id, region, "station DB: region info failed")
-assert_eq(Station[name].id, id, "station DB: name lookup failed")
+
 
 
 ### Region: wrapper class for region data
@@ -236,14 +238,33 @@ assert_eq(Station[name].id, id, "station DB: name lookup failed")
 ###   buy_href      Crest URI base for market buy orders
 ###   sell_href     Crest URI base for market sell orders
 class Region < Datum
-  attr_accessor   :href, :buy_href, :sell_href
-  @data = Hash.new  ### class singleton datastore
+  attr_accessor :id, :name, :href, :buy_href, :sell_href
+  
+  @data = {}        ### Region[] datastore
   @sdd_db           = "evesdd_galatea"
   @sdd_db_table     = "mapregions"
   @sdd_db_fieldmap  = {"regionID"=>:id, "regionName"=>:name}  
+  import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
 end
 ### Region[]: add index by Station id
 Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}
+
+
+
+### Item test cases
+id = 28272
+vol = 10.0
+name = "'Augmented' Hammerhead"
+assert_eq(Item[id].name, name, "item DB: name info failed")
+assert_eq(Item[id].volume, vol, "item DB: volume info failed")
+assert_eq(Item[name].id, id, "item DB: name lookup failed")
+### Station test cases
+id = 60000004
+name = "Muvolailen X - Moon 3 - CBD Corporation Storage"
+region = 10000033
+assert_eq(Station[id].name, name, "station DB: name info failed")
+assert_eq(Station[id].region_id, region, "station DB: region info failed")
+assert_eq(Station[name].id, id, "station DB: name lookup failed")
 ### Region test cases
 id = 10000002
 name = "The Forge"
@@ -252,9 +273,11 @@ assert_eq(Region[name].id, id, "region DB: name lookup failed")
 
 
 
+
 ### Order class - EVE market order
 ### NOTE: data source could be Crest or Marketlogs
-class Order
+class Order < Datum
+  include InitByHash
   attr_accessor \
     :id, :db_id, \
     :item_id, :buy, :price, \
@@ -263,22 +286,19 @@ class Order
     :issued, :duration, :sampled, \
     :ignore
 
-  def initialize(fields={})
-    fields.each { |k,v| instance_variable_set("@#{k}", v) }
-  end
-  
   def to_s
     (buy ? 'bid' : 'ask') + " #{'%17s' % (comma(price, '$'))} #{'%7s' % (comma_i(vol_rem, 'x'))}" + (vol_min > 1 ? " (_#{vol_min})" : "")
   end
 
   ### SQL conversion
-  def self.to_sql_fields
+  def self.to_sql_hdr
     "(order_id, station_id, region_id, item_id, buy, price, price_str, vol, vol_str, ignored)"
   end
   def to_sql
     "(#{id}, #{station_id}, #{region_id}, #{item_id}, #{buy}, #{price}, '#{comma(price, "$")}', #{vol_rem}, '#{comma_i vol_rem}', #{ignore ? 'true' : 'false'})"
   end
 end
+
 
 
 ### TODO: store $markets data in Region[r].buy_orders[item]
@@ -305,11 +325,13 @@ $markets = Hash.new {|h1,region| h1[region] = Hash.new {|h2,item| h2[item] = Mar
 
 
 
-
-### Cache class - key, value (Response.body), expiration time
-### get(key)
-### set(key, val, time)
-### NOTE: _cache[k] = [v, expire]
+### Cache class -- stores 3-tuples (key x value x expiration time)
+### methods
+###   get(key)
+###   set(key, val, time)
+### usage
+###   _cache[k] = [v, expire]
+###   v = Response.body
 class Cache
   CACHE_FILE = "#{__dir__}/cache.txt"
 
@@ -323,13 +345,16 @@ class Cache
   def self.get(k, now=Time.now)
     v, exp = @@_cache[k]
     if v and now < exp
+=begin
       puts "    cache hit #{Crest.pretty k}" if k.match("^#{Crest.re_root}$")
       puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_auth)
       #puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_market)
-      puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/")
+      #puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/")
+      puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/.page=12")
       puts "    cache hit #{Crest.pretty k}" if k.match("/regions/$")
       puts "    cache hit #{Crest.pretty k}" if k.match("/regions/10000001")
       puts "    cache hit #{Crest.pretty k}" if k.match(Evecentral.url_base)
+=end
       @@_hits += 1
       ### access token response is cached with relative "expires_in" value, so adjust to actual TTL
       if k.match(Crest.re_auth) then
@@ -410,8 +435,7 @@ class Cache
     elsif url.match("/market/types/") or url.match("/regions/") or url.match("^#{Crest.re_root}$")
       ret = 60*60
     elsif url.match(Evecentral.url_base) 
-      ret = 60  ### just enough for prefetch results to carryover to real fetch (not saved to cache file)
-      #ret = 60*60  ### test
+      ret = 30  ### just enough for prefetch results to carryover to actual fetch (not saved to cache file)
     elsif url.match(Crest.re_auth) 
       # server-defined
       ret = (JSON.parse(response.body))["expires_in"] 
@@ -428,7 +452,8 @@ end
 
 
 ### FakeResponse - mimic Typhoeus::Response objects for cache hits
-### TODO: refactor mget() to return Response.body instead of Response
+### problem: mget returns Response, cache returns Response.body
+### TODO: refactor mget() to return Response.body instead of Response, so we don't have to do this
 class FakeResponse
   attr_accessor :body, :effective_url, :total_time
 
@@ -439,6 +464,9 @@ class FakeResponse
   end
 end
 
+
+### Source - wrapper class for Typhoeus mget() and get()
+### subclass for each HTTP data source
 class Source
 	@@hydra = Typhoeus::Hydra.new
   
@@ -624,7 +652,7 @@ class Evecentral < Source
 
 ' ### end REGEXP_PROFITABLE
 
-  def self.parse(html)
+  def self.import_html(html)
     
     ### parse preamble
     re_preamble = Regexp.new(REGEXP_PREAMBLE)
@@ -656,7 +684,7 @@ class Evecentral < Source
   ### get_profitables(): get + parse list of profitable trades from evecentral
   ### return value: array of trade IDs (from_stn_id:to_stn_id:item_id)
   def self.get_profitables
-    puts "Evecentral.get_profitables()"
+    #puts "Evecentral.get_profitables()"
 
     ### get html from eve-central.com
     hubs = [SYS_AMARR, SYS_JITA, SYS_DODIXIE]
@@ -669,7 +697,7 @@ class Evecentral < Source
       puts pretty(r.effective_url) + " parsing"
       $counters[:size] += r.body.size
       html = r.body
-      trades = parse(html)
+      trades = import_html(html)
       ret.concat(trades)
     end
     ret
@@ -680,6 +708,8 @@ end ### class Evecentral
 
 
 ### Crest - wrapper class for pulling market data from CCP authenticated CREST
+### public interface
+###   get_trades
 class Crest < Source
   URI_ROOT = 'https://crest-tq.eveonline.com/'
   URI_PATH_ITEMTYPES  = 'marketTypes'   ### "/marketTypes/"
@@ -907,7 +937,7 @@ class Crest < Source
 
   
   ### converts Crest market order "item" to Order object
-  def self.item2order(i, sampled = Time.new(0))
+  def self.import_crest_order(i, sampled = Time.new(0))
     Order.new({
       :id         => i["id"],
       :item_id    => i["type"]["id"],
@@ -937,7 +967,8 @@ class Crest < Source
       href = (buy ? r.buy_href : r.sell_href) + "?type=" + i.href
       proc = Proc.new do |response|
         items = (JSON.parse(response.body))["items"]
-        orders = items.map { |i| item2order(i, sampled) }
+        $counters[:size] += response.body.size
+        orders = items.map { |i| import_crest_order(i, sampled) }
         m.instance_variable_set(buy ? '@buy_orders' : '@sell_orders', orders)
         m.instance_variable_set(buy ? '@buy_sampled' : '@sell_sampled', now)
         #puts ">>> crest #{buy ? 'buy ' : 'sell'} #{'%-11s' % r.name}::#{i.name}  #{now}"
@@ -956,7 +987,7 @@ class Crest < Source
 
   ### get_trades() - fetch market orders; populate $markets[region][item].buy_orders
   def self.get_trades(trades)
-    puts "Crest.get_trades()"
+    #puts "Crest.get_trades()"
     hrefs = []
     procs = {}
     now = Time.now.getutc
@@ -1078,9 +1109,9 @@ class Marketlogs < Source
     end
   end
   
-  ### refresh() - check all marketlog files, import if more recent
-  def self.refresh
-    puts "Marketlogs.refresh()"
+  ### get_all() - check all marketlog files, import if more recent
+  def self.get_all
+    #puts "Marketlogs.get_all()"
     ### call this every 2 sec
     purge_old
     update = false
@@ -1343,7 +1374,7 @@ class Trade
   end
 
   ### SQL conversion
-  def self.to_sql_fields
+  def self.to_sql_hdr
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
   def to_sql
@@ -1391,7 +1422,7 @@ end   ### Trade class
 ### main loop
 while 1
 
-  timer_all = Time.now
+  $timers[:main] = Time.now
   Cache.restore
   prefetch
   Cache.save
@@ -1401,7 +1432,7 @@ while 1
 
   ### get market orders
   Crest.get_trades(candidates)  
-  Marketlogs.refresh            
+  Marketlogs.get_all
   Cache.save
 
   
@@ -1420,7 +1451,7 @@ while 1
   end
   
   ### trades{route}{item} => Trade
-  K_SUM = 'totals'
+  k_sum = 'totals'
   trades = {}   ### trades{route_id}{item} => Trade
   candidates.each do |tuple|
     from_stn, to_stn, iid = tuple
@@ -1428,7 +1459,7 @@ while 1
     to = Region[to_stn].id
     rt = "#{from_stn}:#{to_stn}"
     trades[rt]        ||= {}
-    trades[rt][K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:K_SUM})
+    trades[rt][k_sum] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:k_sum})
     trades[rt][iid]   ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:iid})
     trades[rt][iid].asks = $markets[from][iid].sell_orders
     trades[rt][iid].bids = $markets[to][iid].buy_orders
@@ -1448,7 +1479,7 @@ while 1
     from_stn = from_stn.to_i
     to_stn = to_stn.to_i
     trades[rt].each do |iid, t|
-      next if iid == K_SUM
+      next if iid == k_sum
       asks = t.asks
       bids = t.bids   
 
@@ -1500,18 +1531,18 @@ while 1
       (i_bid...bids.size).each {|x| bids[x].ignore = true}
 
       ### add to route subtotals
-      trades[rt][K_SUM] += t
+      trades[rt][k_sum] += t
       
     end  ### each trade
 
     puts "#{Station[from_stn].sname} -> #{Station[to_stn].sname}"
-    sum = trades[rt][K_SUM]
+    sum = trades[rt][k_sum]
     puts "=> $#{comma(sum.profit / 1_000_000.0)}M total, #{comma_i sum.size.to_i} m3"
     
     ### sort most profitable first
     sorted = trades[rt].values.sort do |a,b| b.profit <=> a.profit end 
     sorted.each do |t| 
-      next if t.item == K_SUM 
+      next if t.item == k_sum 
       puts "  $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
       if t.profit > 100_000_000
         t.asks.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
@@ -1543,7 +1574,7 @@ while 1
   puts "mysql DELETE orders"
   ### insert new db rows
   timer = Time.now
-  q_orders = SqlInsertQ.new(db, "orders", Order.to_sql_fields)
+  q_orders = SqlInsertQ.new(db, "orders", Order.to_sql_hdr)
   orders_by_id.each_value do |o| q_orders << o.to_sql end
   q_orders.flush
   puts "mysql INSERT orders #{Time.now - timer}s"
@@ -1554,8 +1585,8 @@ while 1
   ### DB: trades
   trades_by_id = {}
   trades.each do |r, trades_by_item|
-    trades_by_item.each do |i, t| 
-      next if i == K_SUM 
+    trades_by_item.each do |i, t|
+      next if i == k_sum 
       trades_by_id[t.id] = t
     end
   end
@@ -1564,7 +1595,7 @@ while 1
   puts "mysql DELETE trades"
   ### insert new db rows
   timer = Time.now
-  q_trades = SqlInsertQ.new(db, "trades", Trade.to_sql_fields)
+  q_trades = SqlInsertQ.new(db, "trades", Trade.to_sql_hdr)
   trades_by_id.each_value do |t| q_trades << t.to_sql end
   q_trades.flush
   puts "mysql INSERT trades #{Time.now - timer}s"
@@ -1588,14 +1619,13 @@ while 1
   
 
 	STDERR.puts "\n------------\n"
-  puts "full loop: #{Time.now - timer_all}s"
-  
- 
+  puts "full loop: #{Time.now - $timers[:main]}s"
+   
   size = $counters[:size]; $counters[:size] = 0;
-  puts "cache size:   #{'%.1f' % (Cache.size/1_000_000.0)}MB, #{Cache.length} entries, #{'%.1f' % (Cache.biggest/1_000.0)}KB max"
-	puts "overall size: " + sprintf("%3.1f", size/1_000_000.0) + "MB"
-	puts "overall rate: " + sprintf("%.2f", ((size/1_000_000.0) / $timers[:get])) + "MB/s"
-	puts "overall time: " + $timers[:get].to_s + "s"; $timers[:get] = 0;
+  #puts "cache size:   #{'%.1f' % (Cache.size/1_000_000.0)}MB, #{Cache.length} entries, #{'%.1f' % (Cache.biggest/1_000.0)}KB max"
+	puts "overall downloaded: " + sprintf("%3.1f", size/1_000_000.0) + "MB"
+	#puts "overall rate: " + sprintf("%.2f", ((size/1_000_000.0) / $timers[:get])) + "MB/s"
+	#puts "overall time: " + $timers[:get].to_s + "s"; $timers[:get] = 0;
 	puts "trades: #{$counters[:profitables]}" ; $counters[:profitables] = 0;
 	puts "parse time:   " + ("%.1f" % ($timers[:parse] * 1_000.0)) + "ms"; $timers[:parse] = 0
   gets = $counters[:get]
@@ -1603,7 +1633,9 @@ while 1
 	puts "GETs: #{gets}"
 	puts "cache hits: #{hits} (#{'%.1f' % (hits.to_f * 100.0 / (hits + gets))}%)"
   $counters[:get] = 0;
-	STDERR.puts "\n------------\n"
-	exit
-	sleep 60
+	STDERR.puts "------------\n"
+
+  ### repeat main loop every 60 sec
+  repeat_rem = [60 - (Time.now - $timers[:main]), 0].max
+	sleep repeat_rem
 end ### while 1
