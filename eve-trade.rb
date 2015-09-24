@@ -74,6 +74,7 @@ class Mymysql < Mysql2::Client
   end
 end
 
+
 ### SqlQueue class -- aggregate SQL INSERTs
 ### public methods
 ###   new_insert  -- set db, table, and field names
@@ -188,23 +189,43 @@ class Datum
   def self.delete(id)
     @data.delete(id)
   end
-  
-  def self.export_sql_table(db, db_table)
-    ### wipe table
-    start = Time.now
-    db.query("TRUNCATE `#{db_table}`;")  ### NOTE: this is significantly faster than "DELETE"
-    t_del = Time.now - start
-    ### insert new rows
-    q = SqlQueue.new_insert(db, db_table, self.export_sql_hdr)
-    n = 0
-    timer0 = Time.now
-    self.each do |id, x| q << x.export_sql; n+=1 end
-    t_str = Time.now - timer0
-    q.flush
-    t_ins = Time.now - start
-    puts "INSERT #{db_table} x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_ins-t_del)}s)"
+end
+
+
+### SqlExport interface
+### defined method
+###   self.export_sql_table() -- exports class datastore to DB table (class method)
+### virtual methods
+###   self.export_sql_hdr()   -- list of fieldnames for INSERT query (class method)
+###   export_sql()            -- convert instance to list of values for INSERT query (instance method)
+module SqlExport
+  def export_sql
+    raise NoMethodError # virtual instance method
+  end
+
+  ### class methods (idiom for adding by module)
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
+
+  module ClassMethods
+    def export_sql_hdr
+      raise NoMethodError # virtual class method
+    end
+
+    def export_sql_table(db, db_table)
+      ### wipe table
+      db.query("TRUNCATE `#{db_table}`;")  ### much faster than "DELETE"
+      ### insert new rows
+      q = SqlQueue.new_insert(db, db_table, self.export_sql_hdr)
+      self.each do |id, x| q << x.export_sql end
+      q.flush
+      puts "INSERT #{db_table}"
+      #puts "INSERT #{db_table} x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_ins-t_del)}s)"
+    end
   end
 end
+
 
 
 ### Item class - wrapper class for Eve item data 
@@ -324,6 +345,7 @@ class Order < Datum
     (buy ? 'bid' : 'ask') + " #{'%17s' % (comma(price, '$'))} #{'%7s' % (comma_i(vol_rem, 'x'))}" + (vol_min > 1 ? " (_#{vol_min})" : "")
   end
 
+  include SqlExport
   def self.export_sql_hdr
     "(order_id, station_id, region_id, item_id, buy, price, price_str, vol, vol_str, ignored)"
   end
@@ -1421,6 +1443,7 @@ class Trade < Datum
     self2
   end
 
+  include SqlExport
   def self.export_sql_hdr
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
