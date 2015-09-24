@@ -77,7 +77,7 @@ end
 
 ### SqlQueue class -- aggregate SQL INSERTs
 ### public methods
-###   new_insert  -- set db, table, and field names
+###   new_insert  -- new INSERT query
 ###   <<          -- add line to query (auto-submits if max exceeded)
 ###   flush()     -- submit query
 class SqlQueue
@@ -116,47 +116,7 @@ class SqlQueue
 end
 
 
-
-### import_sdd() - import SDD DB rows into datastore according to field mappings
-###   hash is duplicate indexed by id and name
-### args
-###   SDD_DB_NAME:  source DB
-###   db_table:     source DB table
-###   dst_type:     Class to be instantiated and stored in "dst_store" ["Item", "Station", "Region", etc.]
-###   dst_store:    datastore hash
-###   fieldmap:     src=>dst field mappings, for each field to be imported
-SDD_DB_NAME = "evesdd_galatea"
-def import_sdd(db_table, fieldmap, klass, dst_store) 
-  # skip if already loaded
-  if dst_store.size == 0 then
-    print "loading DB \"#{SDD_DB_NAME}.#{db_table}\"..."
-    start = Time.now
-
-    ### query db
-    db_name = SDD_DB_NAME
-    db = Mymysql.new(db_name)
-    db_fields = fieldmap.keys.join(", ")
-    sql = "SELECT #{db_fields} FROM #{db_table}"
-    results = db.query(sql)
-
-    ### convert row
-    results.each do |src_row|
-      ### define fields and instantiate object
-      dst_fields = {}
-      fieldmap.each { |k_src, k_dst| dst_fields[k_dst] = src_row[k_src] }
-      #klass = Object.const_get(dst_type)  ### lookup constructor by class name
-      x = klass.new(dst_fields)
-      ### save to datastore
-      dst_store[x.id] = x
-      dst_store[x.name] = x if x.name ### duplicate index by name
-    end
-    puts "done (#{sz dst_store}, #{Time.now - start} sec)"
-  end
-end
-
-
-
-### InitByHash -- initialize() via hash of name-value pairs
+### InitByHash module -- instantiate any class via hash of name-value pairs for instance variables 
 module InitByHash
   def initialize(fields={})
     fields.each { |k,v| instance_variable_set("@#{k}", v) }
@@ -167,9 +127,9 @@ end
 ### Datum -- base wrapper class for Eve game data
 ### subclassed for each data type (Item, Region, Station)
 ### each instance is a single data element
-### for DB compatibility, each instance has a unique ID and can be accessed by using the class as a hash
+### class is hash of all instances indexed by ID and name:
 ###   Item[id]
-###   Region[name]  (sometimes duplicate indexed)
+###   Region[name]
 ###   Station.each
 class Datum
   include InitByHash
@@ -192,18 +152,62 @@ class Datum
 end
 
 
-### SqlExport interface
-### defined method
-###   self.export_sql_table() -- exports class datastore to DB table (class method)
+### ImportSql module -- import DB table into Datum class datastore
+### defined methods
+###   import_sql()   -- "fieldmap" is src (DB field) => dst (instance variable) name mappings, for each field imported (class method)
+###   import_sdd2()  -- import from Eve Static Data Dump
+module ImportSql
+  ### idiom for module class methods
+  def self.included(base)
+    base.extend(ClassMethods)
+  end
+  module ClassMethods
+  ### end idiom
+  
+    def import_sql(db_name, db_table, fieldmap)
+      print "loading DB \"#{DB_SDD}.#{db_table}\"..."
+      start = Time.now
+
+      ### query DB
+      db = Mymysql.new(db_name)
+      db_fields = fieldmap.keys.join(", ")
+      sql = "SELECT #{db_fields} FROM #{db_table}"
+      results = db.query(sql)
+
+      results.each do |src_row|
+        ### map fields and instantiate object
+        vals = {}
+        fieldmap.each { |k_src, k_dst| vals[k_dst] = src_row[k_src] }
+        x = self.new(vals) # instantiate by hash
+        ### add to Datum index
+        self[x.id] = x
+        self[x.name] = x if x.name  ### duplicate index by name
+      end
+      
+      #store = self.instance_variable_get(:@data)
+      puts "done (#{sz @data}, #{Time.now - start} sec)"
+    end
+
+    DB_SDD = "evesdd_galatea"
+    def import_sdd2(db_table, fieldmap) 
+      import_sql(DB_SDD, db_table, fieldmap)
+    end
+  end
+end
+
+
+### ExportSql interface -- export Datum class datastore to DB table
+### defined methods
+###   export_sql_table() -- exports class datastore to DB table (class method)
 ### virtual methods
-###   self.export_sql_hdr()   -- list of fieldnames for INSERT query (class method)
-###   export_sql()            -- convert instance to list of values for INSERT query (instance method)
-module SqlExport
+###   export_sql_hdr()   -- list of fieldnames for INSERT query (class method)
+###   export_sql()       -- convert instance to list of values for INSERT query
+module ExportSql
   def export_sql
     raise NoMethodError # virtual instance method
   end
 
-  ### class methods (idiom for adding by module)
+  ### module class methods (idiom)
   def self.included(base)
     base.extend(ClassMethods)
   end
@@ -227,7 +231,6 @@ module SqlExport
 end
 
 
-
 ### Item class - wrapper class for Eve item data 
 ### fields
 ###   id
@@ -237,10 +240,12 @@ end
 class Item < Datum
   attr_accessor :id, :name, :volume, :href
 
-  @data = {}        ### Item[] datastore
-  @sdd_db_table     = "invtypes"
-  @sdd_db_fieldmap  = {"typeID"=>:id, "typeName"=>:name, "volume"=>:volume}
-  import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
+  @data = {}     ### Item[] datastore
+
+  include ImportSql
+  @sdd_table     = "invtypes"
+  @sdd_fieldmap  = {"typeID"=>:id, "typeName"=>:name, "volume"=>:volume}
+  import_sdd2(@sdd_table, @sdd_fieldmap)
 end
 
 
@@ -258,10 +263,12 @@ class Station < Datum
     if @name then @sname = @name[0, @name.index(' ')] end  ### shortname
   end
 
-  @data = {}        ### Station[] datastore
-  @sdd_db_table     = "stastations"
-  @sdd_db_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
-  import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
+  @data = {}     ### Station[] datastore
+
+  include ImportSql
+  @sdd_table     = "stastations"
+  @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
+  import_sdd2(@sdd_table, @sdd_fieldmap)
 end
 
 
@@ -275,10 +282,12 @@ end
 class Region < Datum
   attr_accessor :id, :name, :href, :buy_href, :sell_href
   
-  @data = {}        ### Region[] datastore
-  @sdd_db_table     = "mapregions"
-  @sdd_db_fieldmap  = {"regionID"=>:id, "regionName"=>:name}  
-  import_sdd(@sdd_db_table, @sdd_db_fieldmap, self, @data)
+  @data = {}     ### Region[] datastore
+
+  include ImportSql
+  @sdd_table     = "mapregions"
+  @sdd_fieldmap  = {"regionID"=>:id, "regionName"=>:name}  
+  import_sdd2(@sdd_table, @sdd_fieldmap)
 end
 ### Region[]: add index by Station id
 Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}
@@ -345,7 +354,7 @@ class Order < Datum
     (buy ? 'bid' : 'ask') + " #{'%17s' % (comma(price, '$'))} #{'%7s' % (comma_i(vol_rem, 'x'))}" + (vol_min > 1 ? " (_#{vol_min})" : "")
   end
 
-  include SqlExport
+  include ExportSql
   def self.export_sql_hdr
     "(order_id, station_id, region_id, item_id, buy, price, price_str, vol, vol_str, ignored)"
   end
@@ -1443,7 +1452,7 @@ class Trade < Datum
     self2
   end
 
-  include SqlExport
+  include ExportSql
   def self.export_sql_hdr
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
