@@ -34,7 +34,8 @@ end
 def comma(x, pre="")
   s = '%.2f' % x
   n = s.size - 3
-  min = (x < 0.0)? 4 : 3  ### account for leading "-"
+  min = 3
+  min += 1 if s[0] == '-' ### account for leading "-"
   while n > min
     s.insert(n-3, ',')
     n -= 3
@@ -189,15 +190,19 @@ class Datum
   end
   
   def self.export_sql_table(db, db_table)
-    #db_name, db_table = db_id.split(".")
-    #db = Mymysql.new(db_name)
     ### wipe table
-    db.query("DELETE FROM `#{db_table}`;")
+    start = Time.now
+    db.query("TRUNCATE `#{db_table}`;")  ### NOTE: this is significantly faster than "DELETE"
+    t_del = Time.now - start
     ### insert new rows
     q = SqlQueue.new_insert(db, db_table, self.export_sql_hdr)
-    self.each do |id, x| q << x.export_sql end
+    n = 0
+    timer0 = Time.now
+    self.each do |id, x| q << x.export_sql; n+=1 end
+    t_str = Time.now - timer0
     q.flush
-    puts "INSERT #{db_table}"
+    t_ins = Time.now - start
+    puts "INSERT #{db_table} x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_ins-t_del)}s)"
   end
 end
 
@@ -1373,9 +1378,6 @@ def prefetch
 end
 
 
-
-
-
 class Trade < Datum
   attr_accessor :id, :db_id
   attr_accessor :from_stn, :to_stn, :item, :bids, :asks
@@ -1384,11 +1386,15 @@ class Trade < Datum
   @@uid = 1
   
   @data = {}
-  K_SUM = 'totals'
+  K_SUM = 'totals'  ### special item_id for route totals
+  ### each() -- ignore K_SUM entries
   def self.each
-    @data.values.uniq.each { |v| yield(v.id, v) unless v.item == K_SUM }  ### filter out duplicate indexes
+    @data.values.uniq.each { |v| yield(v.id, v) unless v.item == K_SUM }
   end  
-
+  def self.wipe
+    @data = {}
+  end
+  
   def initialize(fields={})
     ### primary
     @qty = 0
@@ -1475,6 +1481,7 @@ def calc_trades(candidates)
   
   trades = {} ### trades{route_id}{item}  => item
               ### trades{route_id}{Trade::K_SUM} => route totals
+  Trade.wipe  ### reset datastore
   candidates.each do |tuple|
     from_stn, to_stn, iid = tuple
     from = Region[from_stn].id
@@ -1530,6 +1537,7 @@ def calc_trades(candidates)
         t.cost += qty * ask.price
       end  ### match bids/asks
       if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(iid); next end ### no matches
+      #if (i_ask == 0 and i_bid == 0) then trades[rt].delete(iid); next end ### no matches
 
       ### derived calcs
       t.size = t.qty * Item[iid].volume
@@ -1540,6 +1548,9 @@ def calc_trades(candidates)
       if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(iid); next end
       if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(iid); next end
       if t.suspicious                 then Trade.delete(t.id); trades[rt].delete(iid); next end
+      #if t.profit < min_total_profit  then trades[rt].delete(iid); next end
+      #if t.ppv < min_ppv              then trades[rt].delete(iid); next end
+      #if t.suspicious                 then trades[rt].delete(iid); next end
       
       ### flag unprofitable orders
       ### loop exits on (a) first unprofitable match or (b) ran out of bids or asks
@@ -1595,16 +1606,21 @@ class WheatDB
   def export_orders_trades
     start = Time.now
     ### wipe table
-    @db.query("DELETE FROM `orders_trades`;")
+    @db.query("TRUNCATE `orders_trades`;")
     #puts "DELETE orders_trades #{Time.now - start}s"
+    t_del = Time.now - start
     ### insert new rows
     q = SqlQueue.new_insert(@db, "orders_trades", "(order_id, trade_id)")
+    n = 0
+    start2 = Time.now
     Trade.each do |tid, t|
-      t.asks.each do |o| q << "(#{o.id}, #{t.id})" end
-      t.bids.each do |o| q << "(#{o.id}, #{t.id})" end
+      t.asks.each do |o| q << "(#{o.id}, #{t.id})"; n+=1 end
+      t.bids.each do |o| q << "(#{o.id}, #{t.id})"; n+=1 end
     end
+    timer2 = Time.now - start2
     q.flush
-    puts "INSERT orders_trades #{Time.now - start}s"
+    t_ins = Time.now - start
+    puts "INSERT orders_trades x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%timer2}s, ins #{'%.3f'%(t_ins-t_del)}s)"
   end
 end
 
@@ -1629,6 +1645,7 @@ while 1
   db2.export_trades
   db2.export_orders_trades
 
+  
   ### runtime stats
 	STDERR.puts "------------\n"
   puts "full loop: #{Time.now - $timers[:main]}s"
