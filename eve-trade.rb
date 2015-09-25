@@ -6,7 +6,7 @@ require 'base64'
 require 'stringio'
 require 'pp'
 require 'net/http'
-
+require 'rexml/document'
 
 ### global variables
 $timers = Hash.new(0)
@@ -52,6 +52,267 @@ def comma_i(x, pre="")
     n -= 3
   end
   pre + s
+end
+
+
+### Cache class -- (key x value x expiration time)
+### methods
+###   get(key)
+###   set(key, val, time)
+###   ttl() -- defines cache policy based on key (URL) type
+### usage
+###   cache[k] = [v, expire]
+###   v = Response.body
+class Cache
+  CACHE_FILE = "#{__dir__}/cache.txt"
+  @@cache = Hash.new([nil, nil])
+  @@hits = 0
+
+  ### ttl() -- defines cache policy based on URL type
+  ### returns TTL, or nil if uncacheable
+  ### not cached: eve-central.com, google.com
+  def self.ttl(response)
+    ret = nil
+    url = response.effective_url
+    hdr = response.headers 
+
+    ### override for special cases
+    if url.match("google")
+      ret = nil
+    elsif url.match("https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/") 
+      ret = nil
+    elsif url.match("/market/types/") or url.match("/regions/") or url.match("^https://crest-tq.eveonline.com/$")
+      ret = 60*60
+    elsif url.match("ConquerableStationList")
+      ret = 60*60
+    elsif url.match("eve-central.com") 
+      ret = 60  ### only need prefetch to carryover to actual fetch; see Cache.get() 
+    ### server-defined TTLs
+    elsif url.match("https://login-tq.eveonline.com/oauth/token/") 
+      ret = (JSON.parse(response.body))["expires_in"] 
+    elsif hdr["Cache-Control"] and hdr["Cache-Control"].match("max-age=([0-9]+)")
+      ret = $1.to_i
+    end
+
+    ret
+  end
+
+  def self.set(k, v, exp)
+    @@cache[k] = [v, exp]
+  end
+
+  def self.to_m(t)
+    m = (t/60).to_i
+    s = (t - m*60).to_i
+    "#{'%02i'%m}:#{'%02i'%s}"
+  end
+  
+  def self.get(k, now=Time.now)
+    v, exp = @@cache[k]
+    if v and now < exp
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("^https://crest-tq.eveonline.com/?$")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("https://login-tq.eveonline.com/oauth/token/")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/market/types/")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/market/types/.page=12")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/regions/$")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/regions/10000001")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("eve-central.com")
+      puts "    cache hit #{to_m(exp-now)} ConquerableStationList" if k.match("ConquerableStationList")
+      @@hits += 1
+      
+      ### special handling
+      if k.match("https://login-tq.eveonline.com/oauth/token/") then
+        ### access token contains a relative "expires_in", so we adjust it to actual TTL
+        jhash = JSON.parse(v)
+        jhash["expires_in"] = exp - now
+        v = JSON.generate(jhash)
+        @@cache[k] = [v, exp]
+      elsif k.match("eve-central.com")
+        ### eve-central.com cache expires after 1 get (for prefetch only)
+        @@cache.delete(k)
+      end
+
+      v
+    else
+      nil
+    end
+  end
+
+  def self.save
+    fname = CACHE_FILE
+    now = Time.now
+    @@cache.delete_if { |k, (v, exp)| now > exp }
+    f = File.new(fname, "w")
+    @@cache.each do |k, (v, exp)|
+      next if k.match("eve-central.com")  ### do not save eve-central.com (~20MB) 
+      #v, exp = pair
+      #if now > exp then @@cache.delete(k); next end
+      flat = {"key" => k, "val" => v, "exp" => exp.to_i}
+      f.puts JSON.generate(flat)
+    end
+    f.close
+    puts "cache saved #{Time.now-now}s"
+ end
+  
+  def self.restore
+    fname = CACHE_FILE
+    return if not File.exist? fname
+    print "cache loading..."
+    start = Time.now
+    f = File.new(fname, "r")
+    while (line = f.gets)
+      line.chomp!
+      x = JSON.parse(line)
+      k = x["key"]
+      v = x["val"]
+      exp = Time.at(x["exp"]).getutc
+      @@cache[k] = [v, exp] unless exp < start
+    end
+    f.close
+    puts "done #{Time.now-start}s"
+  end
+  
+  def self.hits
+    @@hits
+  end
+  def self.hits=(rval)
+    @@hits
+  end
+  def self.size
+    size = 0
+    @@cache.each do |k, x| size += k.size + x[0].size + x[1].inspect.size end
+    size
+  end
+  def self.length
+    @@cache.length
+  end
+  def self.biggest
+    k, biggest = @@cache.max_by { |x| x[0].size }
+    v, exp = biggest
+    k.size + v.size + exp.inspect.size
+  end
+
+end
+
+
+### CachedResponse - mimic Typhoeus::Response objects for cache hits
+### problem: mget returns Response, cache returns Response.body
+### TODO: refactor mget() to return Response.body instead of Response, so we don't have to do this
+class CachedResponse
+  attr_accessor :body, :effective_url, :total_time
+
+  def initialize(url, body)
+    @effective_url = url
+    @body = body
+    @total_time = 0
+  end
+end
+
+
+### HTTPSource - wrapper class for HTTP get() and mget()
+### subclass for each HTTP data source
+class HTTPSource
+	@@hydra = Typhoeus::Hydra.new
+
+  URI_ROOT = 'https://crest-tq.eveonline.com/'
+  URL_AUTH = "https://login-tq.eveonline.com/oauth/token/"
+  RE_CREST_MARKET2 = "https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/"
+  def self.pretty(href)
+    x = href
+    if x.match(RE_CREST_MARKET2) then x = "#{$1}.#{$3}.#{$2}" end
+    if x.match "eve-central.com" then x = Evecentral.pretty x end
+    if x.match(URL_AUTH) then x = "/oauth/token/" end
+    x = x.gsub(URI_ROOT, "/")
+    x
+  end
+
+  
+  ### get() - returns Response.body
+  def self.get(url, opt = {})
+    urls = [url]
+    opts = {url => opt}
+    responses = mget(urls, opts)
+    responses[0]
+  end
+
+  ### mget() - parallel GETs with optional per-URL callback, returns array of Typhoeus::Response
+  ### arguments:
+  ###   urls[]    - array of URLs to get
+  ###   opts{}    - (optional) HTTP options, applied to all GETs
+  ###   blocks{}  - (optional) response callbacks indexed by URL, *each* callback is optional
+	def self.mget(urls, opts = {}, blocks = {})
+    success = []
+    now = Time.now.getutc
+    puts "mget(#{urls.length}) -- #{pretty urls[0]}"
+    start = nil
+    output = nil
+    while (not urls.empty?)
+      requests = []
+      first = true # debug
+      urls.each do |url|
+        #puts "GET -- #{url}"  ### debug
+        opt = (opts[url])? opts[url] : Hash.new
+        opt[:ssl_verifypeer]  ||= false
+        #opt[:verbose] = true
+        #if url.match(Crest.re_market) then opt[:headers]["Accept"] = "application/vnd.ccp.eve.MarketOrderCollection-v1+json; charset=utf-8" end
+        if url.match(RE_CREST_MARKET2) then opt[:headers].delete("Accept") end
+        
+        body = Cache.get(url, now)
+        if body
+          response2 = CachedResponse.new(url, body)
+          blocks[url].call(response2) if blocks[url]
+          success << response2
+          next
+        end
+        
+        request = Typhoeus::Request.new(url, opt)
+        request.on_complete do |response|
+          output = ">>> #{pretty url} at #{Time.now - start}" unless url.match("/regions/[0-9]{8}") #or url.match(RE_CREST_MARKET2)  
+          puts ">>> #{pretty url} at #{Time.now - start}" unless url.match(RE_CREST_MARKET2) #or url.match("/regions/[0-9]{8}")
+          if response.success?
+            # invoke callback
+            blocks[url].call(response) if blocks[url]
+            success << response
+            ### cache
+            if (ttl = Cache.ttl(response)) then Cache.set(url, response.body, now + ttl) end
+          elsif response.timed_out?
+            puts " => HTTP request timeout: #{pretty url}"
+            urls << url   ### requeue on timeout
+          elsif response.code == 0
+            puts(response.return_message)
+          else
+            puts " => HTTP request failed: #{response.code} #{pretty url}" unless url.match(Crest.re_market)
+            if response.code == 502 then urls << url end    ### requeue on 502 (Crest server bandwidth exceeded)
+          end
+        end
+
+        @@hydra.queue(request)
+        $counters[:get] += 1
+      end
+      urls = [] ### reset queue; callbacks will repopulate
+      
+      start = Time.now
+      @@hydra.run
+      if output then puts output end
+    end ### while
+
+    success
+  end  ### mget()
+
+  ### mget_ary() -- mget() with arguments as array of [url, opt, block] tuples
+  def self.mget_ary(args)
+    urls = []
+    opts = {}
+    callbacks = {}
+    args.each do |x|
+      url, opt, callback = x
+      urls << url
+      opts[url] = opt if opt
+      callbacks[url] = callback if callback
+    end
+    mget(urls, opts, callbacks)
+  end
 end
 
 
@@ -124,14 +385,14 @@ module InitByHash
 end
 
 
-### Datum -- base wrapper class for Eve game data
+### EveDataCollection -- base wrapper class for Eve game data
 ### subclassed for each data type (Item, Region, Station)
-### each instance is a single data element
-### class is hash of all instances indexed by ID and name:
+### instance is a single data element
+### class is hash of all instances indexed by ID and name, eg...
 ###   Item[id]
 ###   Region[name]
 ###   Station.each
-class Datum
+class EveDataCollection
   include InitByHash
   
   def self.[](id)
@@ -143,7 +404,7 @@ class Datum
   end
   
   def self.each
-    @data.values.uniq.each { |v| yield(v.id, v) }  ### filter out duplicate indexes
+    @data.values.uniq.each { |v| yield(v.id, v) }  ### filter out duplicate indices
   end
 
   def self.delete(id)
@@ -152,12 +413,12 @@ class Datum
 end
 
 
-### ImportSql module -- import DB table into Datum class datastore
-### defined methods
-###   import_sql()   -- "fieldmap" is src (DB field) => dst (instance variable) name mappings, for each field imported (class method)
-###   import_sdd2()  -- import from Eve Static Data Dump
+### ImportSql module -- import DB table into EveDataCollection class datastore
+### defined
+###   import_sql()   -- "fieldmap" arg is src (DB field) => dst (instance variable) name mappings, for each field imported (class method)
+###   import_sdd()  -- import from Eve Static Data Dump
 module ImportSql
-  ### idiom for module class methods
+  ### begin idiom for module class methods
   def self.included(base)
     base.extend(ClassMethods)
   end
@@ -174,12 +435,12 @@ module ImportSql
       sql = "SELECT #{db_fields} FROM #{db_table}"
       results = db.query(sql)
 
+      ### map fields and instantiate objects
       results.each do |src_row|
-        ### map fields and instantiate object
         vals = {}
         fieldmap.each { |k_src, k_dst| vals[k_dst] = src_row[k_src] }
         x = self.new(vals) # instantiate by hash
-        ### add to Datum index
+        ### add to EveDataCollection index
         self[x.id] = x
         self[x.name] = x if x.name  ### duplicate index by name
       end
@@ -189,17 +450,17 @@ module ImportSql
     end
 
     DB_SDD = "evesdd_galatea"
-    def import_sdd2(db_table, fieldmap) 
+    def import_sdd(db_table, fieldmap) 
       import_sql(DB_SDD, db_table, fieldmap)
     end
   end
 end
 
 
-### ExportSql interface -- export Datum class datastore to DB table
-### defined methods
+### ExportSql interface -- export EveDataCollection class datastore to DB table
+### defined
 ###   export_sql_table() -- exports class datastore to DB table (class method)
-### virtual methods
+### virtual
 ###   export_sql_hdr()   -- list of fieldnames for INSERT query (class method)
 ###   export_sql()       -- convert instance to list of values for INSERT query
 module ExportSql
@@ -207,12 +468,13 @@ module ExportSql
     raise NoMethodError # virtual instance method
   end
 
-  ### module class methods (idiom)
+  ### begin idiom for module class methods
   def self.included(base)
     base.extend(ClassMethods)
   end
-
   module ClassMethods
+  ### end idiom
+  
     def export_sql_hdr
       raise NoMethodError # virtual class method
     end
@@ -237,7 +499,7 @@ end
 ###   name
 ###   volume
 ###   href
-class Item < Datum
+class Item < EveDataCollection
   attr_accessor :id, :name, :volume, :href
 
   @data = {}     ### Item[] datastore
@@ -245,41 +507,18 @@ class Item < Datum
   include ImportSql
   @sdd_table     = "invtypes"
   @sdd_fieldmap  = {"typeID"=>:id, "typeName"=>:name, "volume"=>:volume}
-  import_sdd2(@sdd_table, @sdd_fieldmap)
+  import_sdd(@sdd_table, @sdd_fieldmap)
 end
 
 
-### Station class - wrapper class for Eve station data 
-### fields
-###   id
-###   name
-###   href
-###   region_id
-###   system_id (solar system)
-class Station < Datum
-  attr_accessor :id, :name, :sname, :href, :region_id, :system_id
-  def initialize(fields={})
-    super(fields)
-    if @name then @sname = @name[0, @name.index(' ')] end  ### shortname
-  end
-
-  @data = {}     ### Station[] datastore
-
-  include ImportSql
-  @sdd_table     = "stastations"
-  @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
-  import_sdd2(@sdd_table, @sdd_fieldmap)
-end
-
-
-### Region: wrapper class for Eve region data
+### Region: wrapper class for Eve region data (REGION > System > Station)
 ### fields
 ###   id
 ###   name
 ###   href          Crest URI for region
 ###   buy_href      Crest URI base for market buy orders
 ###   sell_href     Crest URI base for market sell orders
-class Region < Datum
+class Region < EveDataCollection
   attr_accessor :id, :name, :href, :buy_href, :sell_href
   
   @data = {}     ### Region[] datastore
@@ -287,10 +526,99 @@ class Region < Datum
   include ImportSql
   @sdd_table     = "mapregions"
   @sdd_fieldmap  = {"regionID"=>:id, "regionName"=>:name}  
-  import_sdd2(@sdd_table, @sdd_fieldmap)
+  import_sdd(@sdd_table, @sdd_fieldmap)
 end
-### Region[]: add index by Station id
-Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}
+
+
+### System class - wrapper class for Eve solar system data (Region > SYSTEM > Station)
+### fields
+###   id
+###   name
+###   region_id
+class System < EveDataCollection
+  attr_accessor :id, :name, :region_id
+
+  @data = {}     ### System[] datastore
+
+  include ImportSql
+  @sdd_table     = "mapsolarsystems"
+  @sdd_fieldmap  = {"solarSystemID"=>:id, "solarSystemName"=>:name, "regionID"=>:region_id}
+  import_sdd(@sdd_table, @sdd_fieldmap)
+end
+
+
+### Station class - wrapper class for Eve station data (Region > System > STATION)
+### fields
+###   id
+###   name
+###   href
+###   region_id
+###   system_id (solar system)
+class Station < EveDataCollection
+  attr_accessor :id, :name, :sname, :href, :region_id, :system_id
+
+  @data = {}     ### Station[] datastore
+  # NOTE not all stations are listed in SDD
+
+  STN_AMARR       = 60008494
+  STN_JITA        = 60003760
+  STN_DODIXIE     = 60011866
+  @@nicknames = {
+    STN_AMARR   => "AMARR",
+    STN_JITA    => "JITA",
+    STN_DODIXIE => "DODIXIE",
+  }
+  def initialize(fields={})
+    super(fields)
+    @sname = @@nicknames[@id] ? @@nicknames[@id] : @name  ### shortname
+  end
+
+  ### import from (i) Static Data Dump and (ii) Conquerable Station List
+  include ImportSql
+  @sdd_table     = "stastations"
+  @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
+  import_sdd(@sdd_table, @sdd_fieldmap)
+  def self.import_csl
+    puts ">>> import_csl()"
+    url = "https://api.eveonline.com/eve/ConquerableStationList.xml.aspx"
+    raw = (HTTPSource.get(url)).body
+    xml = REXML::Document.new(raw)
+    xml.elements.each("eveapi/result/rowset/row") do |e| 
+      #print e.attributes["stationID"] + " "
+      id = e.attributes["stationID"].to_i
+      name = e.attributes["stationName"]
+      sys = e.attributes["solarSystemID"].to_i
+      next if Station[id]
+      s = Station.new({id:id, name:name, system_id:sys, region_id:System[sys].region_id})
+      Station[id] = s
+      Station[name] = s
+      Region[id] = Region[s.region_id]
+    end
+  end
+  def self.import_deferred
+    puts ">>> import_deferred()"
+    import_csl
+    #exit
+  end
+  
+  
+  def Station.hub?(x)
+    lookup = {
+      STN_AMARR   => true,
+      STN_JITA    => true,
+      STN_DODIXIE => true,
+    }
+    lookup[x] 
+  end
+end
+
+
+### DataCollections post-processing
+Station.each {|stn_id, stn| stn.region_id ||= System[stn.system_id].region_id}  ### Station[] - link region_id (for CSL adds)
+Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}             ### add Region[] index by Station id
+System.each  {|sys_id, sys| Region[sys_id] = Region[sys.region_id]}             ### add Region[] index by System id 
+
+
 
 
 
@@ -319,7 +647,7 @@ assert_eq(Region[name].id, id, "region DB: name lookup failed")
 
 ### Order class - EVE market order
 ### NOTE: data source could be Crest or Marketlogs
-class Order < Datum
+class Order < EveDataCollection
   attr_accessor \
     :id, :db_id, \
     :item_id, :buy, :price, \
@@ -389,298 +717,51 @@ $markets = Hash.new {|h1,region| h1[region] = Hash.new {|h2,item| h2[item] = Mar
 
 
 
-### Cache class -- stores 3-tuples (key x value x expiration time)
-### methods
-###   get(key)
-###   set(key, val, time)
-###   ttl() -- defines cache policy based on key type
-### usage
-###   _cache[k] = [v, expire]
-###   v = Response.body
-class Cache
-  CACHE_FILE = "#{__dir__}/cache.txt"
-
-  @@_cache = Hash.new([nil, nil])
-  @@_hits = 0
-
-  def self.set(k, v, exp)
-    @@_cache[k] = [v, exp]
-  end
-
-  def self.get(k, now=Time.now)
-    v, exp = @@_cache[k]
-    if v and now < exp
-      #puts "    cache hit #{Crest.pretty k}" if k.match("^#{Crest.re_root}$")
-      #puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_auth)
-      #puts "    cache hit #{Crest.pretty k}" if k.match(Crest.re_market)
-      #puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/")
-      #puts "    cache hit #{Crest.pretty k}" if k.match("/market/types/.page=12")
-      #puts "    cache hit #{Crest.pretty k}" if k.match("/regions/$")
-      #puts "    cache hit #{Crest.pretty k}" if k.match("/regions/10000001")
-      puts "    cache hit #{Crest.pretty k}" if k.match(Evecentral.url_base)
-      @@_hits += 1
-      ### access token response is cached with relative "expires_in" value, so adjust to actual TTL
-      if k.match(Crest.re_auth) then
-        jhash = JSON.parse(v)
-        jhash["expires_in"] = exp - now
-        v = JSON.generate(jhash)
-        @@_cache[k] = [v, exp]
-      elsif k.match(Evecentral.url_base)
-        @@_cache.delete(k)  ### eve-central.com expires after 1 cache get (for prefetch)
-      end
-      v
-    else
-      nil
-    end
-  end
-
-  def self.save
-    fname = CACHE_FILE
-    now = Time.now
-    @@_cache.delete_if { |k, (v, exp)| now > exp }
-    f = File.new(fname, "w")
-    @@_cache.each do |k, pair|
-      next if k.match(Evecentral.url_base)  ### do not save eve-central.com (~20MB) 
-      v, exp = pair
-      if now > exp then @@_cache.delete(k); next end
-      flat = {"key" => k, "val" => v, "exp" => exp.to_i}
-      f.puts JSON.generate(flat)
-    end
-    f.close
-    puts "cache saved #{Time.now-now}s"
- end
-  
-  def self.restore
-    fname = CACHE_FILE
-    return if not File.exist? fname
-    print "cache loading..."
-    start = Time.now
-    f = File.new(fname, "r")
-    while (line = f.gets)
-      line.chomp!
-      x = JSON.parse(line)
-      k = x["key"]
-      v = x["val"]
-      exp = Time.at(x["exp"]).getutc
-      @@_cache[k] = [v, exp] unless exp < start
-    end
-    f.close
-    puts "done #{Time.now-start}s"
-  end
-  
-  def self.hits
-    @@_hits
-  end
-  def self.hits=(rval)
-    @@_hits
-  end
-  def self.size
-    size = 0;
-    @@_cache.each do |k, x| size += k.size + x[0].size + x[1].inspect.size end
-    size
-  end
-  def self.length
-    @@_cache.length
-  end
-  def self.biggest
-    k, biggest = @@_cache.max_by { |x| x[0].size }
-    v, exp = biggest
-    k.size + v.size + exp.inspect.size
-  end
-
-  ### ttl() - returns TTL, or nil if not cacheable 
-  ### not cached: eve-central.com, google.com
-  def self.ttl(response)
-    ret = nil
-    url = response.effective_url
-    hdr = response.headers 
-
-    ### override for special cases
-    if url.match("google")
-      ret = nil
-    elsif url.match(Crest.re_market) 
-      ret = nil
-    elsif url.match("/market/types/") or url.match("/regions/") or url.match("^#{Crest.re_root}$")
-      ret = 60*60
-    elsif url.match(Evecentral.url_base) 
-      ret = 60  ### just enough for prefetch to carryover to actual fetch
-    ### server-defined TTLs
-    elsif url.match(Crest.re_auth) 
-      ret = (JSON.parse(response.body))["expires_in"] 
-    elsif hdr["Cache-Control"] and hdr["Cache-Control"].match("max-age=([0-9]+)")
-      ret = $1.to_i
-    end
-
-    ret
-  end
-
-end
-
-
-
-### FakeResponse - mimic Typhoeus::Response objects for cache hits
-### problem: mget returns Response, cache returns Response.body
-### TODO: refactor mget() to return Response.body instead of Response, so we don't have to do this
-class FakeResponse
-  attr_accessor :body, :effective_url, :total_time
-
-  def initialize(url, body)
-    @effective_url = url
-    @body = body
-    @total_time = 0
-  end
-end
-
-
-### Source - wrapper class for Typhoeus mget() and get()
-### subclass for each HTTP data source
-class Source
-	@@hydra = Typhoeus::Hydra.new
-  
-  def self.get(url, opt = {})
-    urls = [url]
-    opts = {url => opt}
-    responses = mget(urls, opts)
-    responses[0]
-  end
-  
-  ### mget() - parallel GETs with optional per-URL callback, returns array of Response.body's
-  ### arguments:
-  ###   urls[]    - array of URLs to get
-  ###   opts{}    - (optional) hash of HTTP options, applied to all GETs
-  ###   blocks{}  - (optional) hash of response callbacks indexed by URL, *each* callback is optional
-	def self.mget(urls, opts = {}, blocks = {})
-    success = []
-    now = Time.now.getutc
-    puts "mget(#{urls.length}) -- #{Crest.pretty urls[0]}"
-    start = nil
-    output = nil
-    while (not urls.empty?)
-      requests = []
-      first = true # debug
-      urls.each do |url|
-        #puts "GET -- #{url}"  ### debug
-        opt = (opts[url])? opts[url] : Hash.new
-        opt[:ssl_verifypeer]  ||= false
-        #opt[:ssl_verifypeer]  ||= true
-        #opt[:followlocation]  ||= true
-        #opt[:ssl_cipher_list] ||= "TLSv1"
-        #opt[:cainfo]          ||= "#{__dir__}/cacert.pem"
-        #opt[:verbose] = true
-        #if url.match(Crest.re_market) then opt[:headers]["Accept"] = "application/vnd.ccp.eve.MarketOrderCollection-v1+json; charset=utf-8" end
-        if url.match(Crest.re_market) then opt[:headers].delete("Accept") end
-        
-        body = Cache.get(url, now)
-        if body
-          response2 = FakeResponse.new(url, body)
-          blocks[url].call(response2) if blocks[url]
-          success << response2
-          next
-        end
-        
-        request = Typhoeus::Request.new(url, opt)
-        request.on_complete do |response|
-          output = ">>> #{pretty url} at #{Time.now - start}" unless url.match("/regions/[0-9]{8}") #or url.match(Crest.re_market)
-          if response.success?
-            # invoke callback
-            blocks[url].call(response) if blocks[url]
-            success << response
-            ### cache
-            if (ttl = Cache.ttl(response)) then Cache.set(url, response.body, now + ttl) end
-          elsif response.timed_out?
-            puts("timeout")
-            urls << url
-            exit
-          elsif response.code == 0
-            puts(response.return_message)
-          else
-            puts " => HTTP request failed: #{response.code} #{Crest.pretty url}" unless url.match(Crest.re_market)
-            if response.code == 502 then urls << url end    ### requeue 502s
-          end
-        end
-
-        @@hydra.queue(request)
-        $counters[:get] += 1
-      end
-      urls = [] ### reset queue; callbacks will repopulate
-      
-      start = Time.now
-      @@hydra.run
-      if output then puts output end
-    end ### while
-
-    success
-  end
-end
-
 
 ### Evecentral - wrapper class for pulling tradefinder results from eve-central.com
 ### public interface:
 ###   get_profitables() => returns array of joined strings "<from_stn_id>:<to_stn_id>:<item_id>"
-class Evecentral < Source
+class Evecentral < HTTPSource
   URL_BASE = "https://eve-central.com/home/tradefind_display.html"
+  MAX_DELAY       = 48
+  MIN_PROFIT      = 1000
+  MAX_SPACE       = 8967
+  MAX_RESULTS     = 99999
+  
+  SYS_AMARR       = 30002187
+  SYS_JITA        = 30000142
+  SYS_DODIXIE     = 30002659
 
-  STN_AMARR   = 60008494
-  STN_JITA    = 60003760
-  STN_DODIXIE = 60011866
-
-  SYS_AMARR = 	30002187
-  SYS_JITA = 		30000142
-  SYS_DODIXIE = 30002659
-
-  def self.stn_is_hub(x) 
-    lookup = {
-      STN_AMARR   => true,
-      STN_JITA    => true,
-      STN_DODIXIE => true,
-    }
-    lookup[x] 
-  end
-
+  ### these stations are NOT in SDD!
+  ### "Y9-MDG V - Crow's Nest"
+  REG_PROVIDENCE  = 10000047
+  SYS_Y9          = 30003734
+  ### "E-YCML IV - Lion's Den"
+  STN_EY          = 61000175
+  SYS_EY          = 30003732
+  
   def self.pretty(url)
-    sys2sn = {
-      SYS_AMARR => "Amarr", 
-      SYS_JITA => "Jita", 
-      SYS_DODIXIE => "Dodixie",
-    }
-    sys_from = url.match("&fromt=([0-9]+)&")[1].to_i
-    sys_to   = url.match("&to=([0-9]+)&")[1].to_i
-    sys2sn[sys_from] + "-to-" + sys2sn[sys_to]
+    if url.match(URL_BASE) then
+      sys2sn = {
+        SYS_AMARR       => "Amarr", 
+        SYS_JITA        => "Jita", 
+        SYS_DODIXIE     => "Dodixie",
+        REG_PROVIDENCE  => "Providence",
+        Region[SYS_AMARR].id => "Amarr",
+        Region[SYS_JITA].id => "Jita",
+        Region[SYS_DODIXIE].id => "Dodixie",
+      }
+      sys_from = url.match("&fromt=([0-9]+)&")[1].to_i
+      sys_to   = url.match("&to=([0-9]+)&")[1].to_i
+      sys2sn[sys_from] + "-to-" + sys2sn[sys_to]
+    else
+      super(url)
+    end
   end
 
   ### URLs for eve-central.com
   def self.url_base
     URL_BASE
-  end
-  def self.url_evecentral(from, to)
-    maxDelay    = 48
-    minProfit   = 1000
-    maxSpace    = 8967
-    maxRecords  = 99999
-
-    params = \
-      "?set=1" + \
-      "&fromt=#{from}" + \
-      "&to=#{to}" + \
-      "&qtype=Systems" + \
-      "&age=#{maxDelay}" + \
-      "&minprofit=#{minProfit}" + \
-      "&size=#{maxSpace}" + \
-      "&limit=#{maxRecords}" + \
-      "&sort=sprofit" + \
-      "&prefer_sec=0"
-
-    url = URL_BASE + params
-  end
-  
-  def self.urls_all_routes(hubs)
-    urls = []
-    hubs.each do |from|
-      hubs.each do |to| 
-        urls << url_evecentral(from, to) unless from == to 
-      end
-    end
-    urls
   end
 
   REGEXP_PREAMBLE = \
@@ -732,11 +813,15 @@ class Evecentral < Source
     start_parse = Time.new
     n = $counters[:profitables]
     while (m = re_block.match(m.post_match)) do
+      
       $counters[:profitables] += 1
+      if (not Station[m[:askLocation]] or not Station[m[:bidLocation]]) then
+        puts "#{m[:askLocation]} => #{m[:bidLocation]}"
+      end
       from = Station[m[:askLocation]].id
       to = Station[m[:bidLocation]].id
       item = m[:itemID].to_i
-      next if !stn_is_hub(from) || !stn_is_hub(to)  ### hub stations only
+      #next if !Station.hub?(from) || !Station.hub?(to)  ### hub stations only
       trade = [from, to, item]
       trade_id = trade.join(":")
       trades[trade_id] = trade  ### filter out dups
@@ -747,6 +832,56 @@ class Evecentral < Source
 
     trades.values
   end
+
+
+  def self.url_by_sys(from_sys, to_sys)
+    params = \
+      "?set=1" + \
+      "&fromt=#{from_sys}" + \
+      "&to=#{to_sys}" + \
+      "&qtype=Systems" + \
+      "&age=#{MAX_DELAY}" + \
+      "&minprofit=#{MIN_PROFIT}" + \
+      "&size=#{MAX_SPACE}" + \
+      "&limit=#{MAX_RESULTS}" + \
+      "&sort=sprofit" + \
+      "&prefer_sec=0"
+    url = URL_BASE + params
+  end
+  
+  def self.url_by_reg(from_r, to_r)
+    params = \
+      "?set=1" + \
+      "&fromt=#{from_r}" + \
+      "&to=#{to_r}" + \
+      "&qtype=Regions" + \
+      "&age=#{MAX_DELAY}" + \
+      "&minprofit=#{MIN_PROFIT}" + \
+      "&size=#{MAX_SPACE}" + \
+      "&limit=#{MAX_RESULTS}" + \
+      "&sort=sprofit" + \
+      "&prefer_sec=0"
+    url = URL_BASE + params
+  end
+  
+  def self.urls_all_routes_by_sys(x)
+    urls = []
+    x.each do |from|
+      x.each do |to| 
+        urls << url_by_sys(from, to) unless from == to 
+      end
+    end
+    urls
+  end
+  def self.urls_all_routes_by_reg(x)
+    urls = []
+    x.each do |from|
+      x.each do |to| 
+        urls << url_by_reg(from, to) unless from == to 
+      end
+    end
+    urls
+  end
   
   ### get_profitables(): get + parse list of profitable trades from evecentral
   ### return value: array of trade IDs (from_stn_id:to_stn_id:item_id)
@@ -754,18 +889,21 @@ class Evecentral < Source
     #puts "Evecentral.get_profitables()"
 
     ### get html from eve-central.com
-    hubs = [SYS_AMARR, SYS_JITA, SYS_DODIXIE]
-    responses = mget(urls_all_routes(hubs))
+    #hubs = [SYS_AMARR, SYS_JITA, SYS_DODIXIE]
+    #urls = urls_all_routes_by_sys(hubs)
+    r = [Region[SYS_AMARR].id, Region[SYS_JITA].id, Region[SYS_DODIXIE].id, Evecentral::REG_PROVIDENCE]
+    urls = urls_all_routes_by_reg(r)
+    responses = mget(urls)
     $timers[:get] += (responses.max_by {|x| x.total_time}).total_time
 
     ### parse html
     ret = []
     responses.each do |r|
-      puts pretty(r.effective_url) + " parsing"
+      puts pretty(r.effective_url) + " parsing #{'%.2f'%(r.body.size/1_000_000.0)}M"
       $counters[:size] += r.body.size
       html = r.body
-      trades = import_html(html)
-      ret.concat(trades)
+      profitables = import_html(html)
+      ret.concat(profitables)
     end
     ret
   end
@@ -777,7 +915,7 @@ end ### class Evecentral
 ### Crest - wrapper class for pulling market data from CCP authenticated CREST
 ### public interface
 ###   import_orders
-class Crest < Source
+class Crest < HTTPSource
   URI_ROOT = 'https://crest-tq.eveonline.com/'
   URI_PATH_ITEMTYPES  = 'marketTypes'   ### "/marketTypes/"
   URI_PATH_REGIONS    = 'regions'       ### "/regions/"
@@ -949,7 +1087,7 @@ class Crest < Source
     @@root_hrefs[URI_PATH_REGIONS]["href"]
   end
 
-  
+
   RE_CREST_MARKET2 = "https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/"
   def self.pretty(href)
     x = href
@@ -1029,6 +1167,7 @@ class Crest < Source
   def self._get_market_orders(region, item, now, buy)
     _load_static_data unless @@_static_loaded
     r = Region[region]
+    assert(r, "bad index Region[#{region}]")
     i = Item[item]
     m = $markets[region][item]
     sampled = buy ? m.buy_sampled : m.sell_sampled
@@ -1062,6 +1201,18 @@ class Crest < Source
     now = Time.now.getutc
     trades.each do |t|
       from_stn, to_stn, item = t
+      if not Station[from_stn.to_i].region_id then puts "\"from\" station.region #{from_stn} not found" end
+      if not Station[to_stn.to_i].region_id   then 
+        puts "\"to\" station.region #{to_stn} not found" 
+        stn_id = to_stn.to_i
+        stn = Station[stn_id]
+        sys_id = stn.system_id
+        sys = System[sys_id]
+        
+        puts ">>> PROBLEM Station \##{stn_id} in System \##{sys_id}"
+        pp stn
+        pp sys
+      end
       from = Station[from_stn.to_i].region_id
       to = Station[to_stn.to_i].region_id
       item = item.to_i
@@ -1072,16 +1223,18 @@ class Crest < Source
       procs[href] = proc if href
       ### get buy orders
       href, proc = _get_market_buy_orders(to, item, now)
-      hrefs << href if href
-      procs[href] = proc if href
+      next if href == nil
+      hrefs << href
+      procs[href] = proc
     end
+    hrefs.uniq!
     responses = Crest.get_hrefs_each(hrefs, procs) ### multi-get
   end
   
 end ### class Crest
 
 
-class Marketlogs < Source
+class Marketlogs < HTTPSource
   ### known filename transformations {filename => in_game_name}
   @@fname2name = {
     'GDN-9 Nightstalker Combat Goggles' => 'GDN-9 "Nightstalker" Combat Goggles',
@@ -1223,27 +1376,11 @@ end ### class Marketlogs
 
 
 
-
-
-
 ###
 ### prefetch
 ###
 
-def _prefetch_mget(mget_q)
-  urls = []
-  opts = {}
-  callbacks = {}
-  mget_q.each do |x|
-    url, opt, callback = x
-    urls << url
-    opts[url] = opt if opt
-    callbacks[url] = callback if callback
-  end
-  Crest.mget(urls, opts, callbacks)
-end
-
-def prefetch
+def prefetch(upto = 1028)
   prefetch_start = Time.now
   
   ###
@@ -1252,23 +1389,23 @@ def prefetch
   mget_q = []   ### aggregate mget requests
   ### Phase 1: Crest access token
   url = "https://login-tq.eveonline.com/oauth/token/"
-  opt = Crest.refresh_atoken_opts
-  callback = Crest.method(:set_atoken)  ### callback is singleton method
-  #puts callback
-  mget_q << [url, opt, callback]
+  mget_q << [url, Crest.refresh_atoken_opts, Crest.method(:set_atoken)]
   ### Phase 1: Crest root
   mget_q << ['https://crest-tq.eveonline.com/', nil, nil]
+  mget_q << ['https://api.eveonline.com/eve/ConquerableStationList.xml.aspx', nil, nil]
+  
   #mget_q << ['http://www.google.com', nil, nil]
   #mget_q << ['https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30000142&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0', nil, nil]
   ### Phase 1: mget
-  _prefetch_mget(mget_q)
-
+  Crest.mget_ary(mget_q)
+  if upto == 1 then return end
+  
   ###
   ### Phase 2
   ###
   mget_q = []
   ### Phase 2: eve-central profitables
-  urls1 = [
+  urls1 = [ ### 3 systems
   'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30000142&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
   'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30002659&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
   'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30000142&to=30002187&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
@@ -1276,6 +1413,25 @@ def prefetch
   'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002659&to=30002187&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
   'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002659&to=30000142&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
   ]
+  urls1 = [ ### 4 regions
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000032&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000043&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000047&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000002&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000043&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000047&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000002&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000032&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000047&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000002&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000032&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000043&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  ]
+  # 10000002 The Forge (Jita)
+  # 10000032 Sing Laison (Dodixie)
+  # 10000043 Domain (Amarr)
+  # 10000047 Providence
+
   urls1.each do |url| mget_q << [url, nil, nil] end
   ### Phase 2: Crest root, regions, itemtypes
   urls2 = [
@@ -1403,13 +1559,13 @@ def prefetch
   opt[:method] = :get
   urls2.each do |url| mget_q << [url, opt, nil] end
   ### Phase 2: mget
-  _prefetch_mget(mget_q)
+  Crest.mget_ary(mget_q)
 
   puts "prefetch #{Time.now - prefetch_start}s"
 end
 
 
-class Trade < Datum
+class Trade < EveDataCollection
   attr_accessor :id, :db_id
   attr_accessor :from_stn, :to_stn, :item, :bids, :asks
   attr_accessor :qty, :profit, :cost, :age, :size, :ppv, :roi
@@ -1418,9 +1574,8 @@ class Trade < Datum
   
   @data = {}
   K_SUM = 'totals'  ### special item_id for route totals
-  ### each() -- ignore K_SUM entries
   def self.each
-    @data.values.uniq.each { |v| yield(v.id, v) unless v.item == K_SUM }
+    @data.values.uniq.each { |v| yield(v.id, v) unless v.item == K_SUM }  ### ignore K_SUM entries
   end  
   def self.wipe
     @data = {}
@@ -1457,11 +1612,13 @@ class Trade < Datum
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
   def export_sql
-    itemname_esc = Mysql2::Client.escape(Item[item].name)
-    "(#{id}, '#{Station[from_stn].sname}', '#{Station[to_stn].sname}', '#{itemname_esc}', #{qty}, #{profit}, #{cost}, #{size}, #{ppv}, #{roi})"
+    from_stn_e = Mysql2::Client.escape(Station[from_stn].sname)
+    to_stn_e   = Mysql2::Client.escape(Station[to_stn].sname)
+    itemname_e = Mysql2::Client.escape(Item[item].name)
+    "(#{id}, '#{from_stn_e}', '#{to_stn_e}', '#{itemname_e}', #{qty}, #{profit}, #{cost}, #{size}, #{ppv}, #{roi})"
   end
 
-  def suspicious
+  def suspicious?
     known_scams = {
       "Cormack's Modified Armor Thermic Hardener" => true,
       "Draclira's Modified EM Plating" => true,
@@ -1516,8 +1673,8 @@ def calc_trades(candidates)
   Trade.wipe  ### reset datastore
   candidates.each do |tuple|
     from_stn, to_stn, iid = tuple
-    from = Region[from_stn].id
-    to = Region[to_stn].id
+    from = Station[from_stn].region_id
+    to = Station[to_stn].region_id
     rt = "#{from_stn}:#{to_stn}"
     trades[rt]               ||= {}
     trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:Trade::K_SUM})
@@ -1532,6 +1689,7 @@ def calc_trades(candidates)
   min_profit = 1
   min_ppv = 1_000
   min_total_profit = 3_000_000
+  min_route_profit = 20_000_000
 
   ### match bids/asks
   ### iterate through all trades[route][item]
@@ -1579,10 +1737,10 @@ def calc_trades(candidates)
       ### skip? check profit thresholds, known scams, etc.
       if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(iid); next end
       if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(iid); next end
-      if t.suspicious                 then Trade.delete(t.id); trades[rt].delete(iid); next end
+      if t.suspicious?                 then Trade.delete(t.id); trades[rt].delete(iid); next end
       #if t.profit < min_total_profit  then trades[rt].delete(iid); next end
       #if t.ppv < min_ppv              then trades[rt].delete(iid); next end
-      #if t.suspicious                 then trades[rt].delete(iid); next end
+      #if t.suspicious?                 then trades[rt].delete(iid); next end
       
       ### flag unprofitable orders
       ### loop exits on (a) first unprofitable match or (b) ran out of bids or asks
@@ -1598,10 +1756,19 @@ def calc_trades(candidates)
       ### add to route totals
       trades[rt][Trade::K_SUM] += t
     end  ### each trade[rt][item]
+  end
+  
+  routes_inc = trades.keys.sort_by {|rt| trades[rt][Trade::K_SUM].profit}
+  routes_inc.each do |rt|
+    from_stn, to_stn = rt.split(':')
+    from_stn = from_stn.to_i
+    to_stn = to_stn.to_i
 
     ### print routes
-    puts "#{Station[from_stn].sname} -> #{Station[to_stn].sname}"
     totals = trades[rt][Trade::K_SUM]
+    next if totals.profit == 0 
+    next if totals.profit < min_route_profit
+    puts "[#{Region[Station[from_stn].region_id].name}] #{Station[from_stn].sname}  =>  [#{Region[Station[to_stn].region_id].name}] #{Station[to_stn].sname}"
     puts "=> $#{comma(totals.profit / 1_000_000.0)}M total, #{comma_i totals.size.to_i} m3"
     
     ### sort most profitable first
@@ -1661,13 +1828,17 @@ Cache.restore
 ### main loop
 while 1
   $timers[:main] = Time.now
-  prefetch
+
+  prefetch 1
+  Cache.save
+  Station.import_deferred
+  
+  prefetch 2
+  Cache.save
 
   candidates = Evecentral.get_profitables # returns 3-tuple [from_stn, to_stn, item] 
   Crest.import_orders(candidates)         # populates $markets
   Marketlogs.import_orders                # populates $markets
-  Cache.save
-
   trades = calc_trades(candidates)        # confirm trades against fresh market data
 
   ### export to DB: orders, trades, orders_trades
@@ -1694,6 +1865,9 @@ while 1
   $counters[:get] = 0;
 	STDERR.puts "------------\n"
 
+  
+  ### TODO: refresh Marketlogs every 5 sec
+  
   ### repeat main loop every 60 sec
   repeat_rem = [60 - (Time.now - $timers[:main]), 0].max
 	sleep repeat_rem
