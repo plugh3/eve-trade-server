@@ -5,13 +5,14 @@ require 'json'
 require 'base64'
 require 'stringio'
 require 'pp'
-require 'net/http'
+#require 'net/http'
 require 'rexml/document'
+require 'clipboard'
 
 ### global variables
 $timers = Hash.new(0)
 $counters = Hash.new(0)
-
+$debug_urls = []
 
 
 ### utility functions
@@ -97,8 +98,34 @@ class Cache
     ret
   end
 
+  SYS_AMARR       = 30002187
+  SYS_JITA        = 30000142
+  SYS_DODIXIE     = 30002659
+  REG_PROVIDENCE  = 10000047
+  REG_AMARR       = 10000043
+  REG_JITA        = 10000002
+  REG_DODIXIE     = 10000032
+
+  def self.pretty(url)
+    sys2sn = {
+      SYS_AMARR       => "Amarr", 
+      SYS_JITA        => "Jita", 
+      SYS_DODIXIE     => "Dodixie",
+      REG_PROVIDENCE  => "Providence",
+      REG_AMARR       => "Amarr", 
+      REG_JITA        => "Jita", 
+      REG_DODIXIE     => "Dodixie",
+    }
+    sys_from = url.match("&fromt=([0-9]+)&")[1].to_i
+    sys_to   = url.match("&to=([0-9]+)&")[1].to_i
+    sys2sn[sys_from] + "-to-" + sys2sn[sys_to]
+  end
+
+  ### TODO: find out why evecentral is not caching on the first get
+  # seems to be cached on 2nd get, carrying over to prefetch of next loop
   def self.set(k, v, exp)
     @@cache[k] = [v, exp]
+#    if k.match("eve-central.com") then puts "!!! caching #{pretty k}" end
   end
 
   def self.to_m(t)
@@ -113,7 +140,7 @@ class Cache
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("^https://crest-tq.eveonline.com/?$")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("https://login-tq.eveonline.com/oauth/token/")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/")
-      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/market/types/")
+      puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/market/types/$")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/market/types/.page=12")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/regions/$")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/regions/10000001")
@@ -129,7 +156,7 @@ class Cache
         v = JSON.generate(jhash)
         @@cache[k] = [v, exp]
       elsif k.match("eve-central.com")
-        ### eve-central.com cache expires after 1 get (for prefetch only)
+        ### eve-central.com cache expires after 1 get (prefetch only; no carryover between loops)
         @@cache.delete(k)
       end
 
@@ -145,9 +172,7 @@ class Cache
     @@cache.delete_if { |k, (v, exp)| now > exp }
     f = File.new(fname, "w")
     @@cache.each do |k, (v, exp)|
-      next if k.match("eve-central.com")  ### do not save eve-central.com (~20MB) 
-      #v, exp = pair
-      #if now > exp then @@cache.delete(k); next end
+      next if k.match("eve-central.com")  ### do not save eve-central.com (~40MB) 
       flat = {"key" => k, "val" => v, "exp" => exp.to_i}
       f.puts JSON.generate(flat)
     end
@@ -269,7 +294,7 @@ class HTTPSource
         request = Typhoeus::Request.new(url, opt)
         request.on_complete do |response|
           output = ">>> #{pretty url} at #{Time.now - start}" unless url.match("/regions/[0-9]{8}") #or url.match(RE_CREST_MARKET2)  
-          puts ">>> #{pretty url} at #{Time.now - start}" unless url.match(RE_CREST_MARKET2) #or url.match("/regions/[0-9]{8}")
+          #puts ">>> #{pretty url} at #{Time.now - start}" unless url.match(RE_CREST_MARKET2) #or url.match("/regions/[0-9]{8}")
           if response.success?
             # invoke callback
             blocks[url].call(response) if blocks[url]
@@ -354,7 +379,7 @@ class SqlQueue
     @sql = @sql_base.dup
     ### query max packet size
     r = @db.query("SHOW variables LIKE 'max_allowed_packet';")
-    r.each do |row| @sql_max = (row["Value"].to_i - SQL_MAX_ADJUST) if row["Variable_name"] == 'max_allowed_packet' end
+    r.each {|row| if row["Variable_name"]=='max_allowed_packet' then @sql_max = row["Value"].to_i - SQL_MAX_ADJUST; break end}
   end
 
   def self.new_insert(db, table, field_names)
@@ -377,15 +402,8 @@ class SqlQueue
 end
 
 
-### InitByHash module -- instantiate any class via hash of name-value pairs for instance variables 
-module InitByHash
-  def initialize(fields={})
-    fields.each { |k,v| instance_variable_set("@#{k}", v) }
-  end
-end
-
-
 ### EveDataCollection -- base wrapper class for Eve game data
+### objects instantiated by hash of instance variable name-value pairs
 ### subclassed for each data type (Item, Region, Station)
 ### instance is a single data element
 ### class is hash of all instances indexed by ID and name, eg...
@@ -393,14 +411,22 @@ end
 ###   Region[name]
 ###   Station.each
 class EveDataCollection
-  include InitByHash
-  
-  def self.[](id)
-    @data[id]
+  @data = {}
+  def initialize(fields={})
+    fields.each { |k,v| instance_variable_set("@#{k}", v) }
+    #puts "\ninitialize()"
+    #print "self>"; pp self
+    #print "fields>"; pp fields
+    self.class[@id] = self
+    self.class[@name] = self if @name
   end
   
   def self.[]=(id, rval)
     @data[id] = rval
+  end
+  
+  def self.[](id)
+    @data[id]
   end
   
   def self.each
@@ -410,8 +436,33 @@ class EveDataCollection
   def self.delete(id)
     @data.delete(id)
   end
+
+  def ref_accessor(*id_syms)
+    id_syms.each do |id_sym|
+      id_name = id_sym.to_s
+      obj_name = id_name.chomp("_id")
+      klass = Object.get_const(obj_name.capitalize)
+      #obj_name = klass.to_s.downcase
+      #id_name = obj_name + "_id"
+
+      ### id accessor
+      attr_accessor id_sym
+      ### object accessor
+      out = "def #{obj_name};#{klass.to_s}[@#{id_name}];end" #debug
+      puts "accessor test>#{out}" #debug
+      klass.class_eval("def #{obj_name};#{klass.to_s}[@#{id_name}];end")
+    end
+  end
+
 end
 
+### TEST
+module ItemRef
+  attr_accessor :item_id
+  def item
+    Item[@item_id]
+  end
+end
 
 ### ImportSql module -- import DB table into EveDataCollection class datastore
 ### defined
@@ -428,24 +479,22 @@ module ImportSql
     def import_sql(db_name, db_table, fieldmap)
       print "loading DB \"#{DB_SDD}.#{db_table}\"..."
       start = Time.now
-
       ### query DB
       db = Mymysql.new(db_name)
       db_fields = fieldmap.keys.join(", ")
       sql = "SELECT #{db_fields} FROM #{db_table}"
       results = db.query(sql)
-
       ### map fields and instantiate objects
       results.each do |src_row|
         vals = {}
         fieldmap.each { |k_src, k_dst| vals[k_dst] = src_row[k_src] }
+        #puts ""
+        #print "fieldmap>"; pp fieldmap
+        #print "vals>"; pp vals
+        #print "row>"; pp src_row
+        #puts #{results.size} rows"
         x = self.new(vals) # instantiate by hash
-        ### add to EveDataCollection index
-        self[x.id] = x
-        self[x.name] = x if x.name  ### duplicate index by name
       end
-      
-      #store = self.instance_variable_get(:@data)
       puts "done (#{sz @data}, #{Time.now - start} sec)"
     end
 
@@ -460,7 +509,7 @@ end
 ### ExportSql interface -- export EveDataCollection class datastore to DB table
 ### defined
 ###   export_sql_table() -- exports class datastore to DB table (class method)
-### virtual
+### requires
 ###   export_sql_hdr()   -- list of fieldnames for INSERT query (class method)
 ###   export_sql()       -- convert instance to list of values for INSERT query
 module ExportSql
@@ -479,15 +528,20 @@ module ExportSql
       raise NoMethodError # virtual class method
     end
 
-    def export_sql_table(db, db_table)
+    def export_sql_table(db, db_table, filter = nil)
+      t0 = Time.now
       ### wipe table
       db.query("TRUNCATE `#{db_table}`;")  ### much faster than "DELETE"
+      t_del = Time.now - t0
       ### insert new rows
       q = SqlQueue.new_insert(db, db_table, self.export_sql_hdr)
-      self.each do |id, x| q << x.export_sql end
+      n = 0
+      self.each { |id, x| if !filter or filter.call(x) then q << x.export_sql ; n+=1 end }
+      t_str = Time.now - t0 - t_del
       q.flush
-      puts "INSERT #{db_table}"
-      #puts "INSERT #{db_table} x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_ins-t_del)}s)"
+      t_all = Time.now - t0
+      #puts "INSERT #{db_table}"
+      puts "INSERT #{db_table} x#{n} -- #{'%.3f'%t_all}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_all-t_del)}s)"
     end
   end
 end
@@ -538,6 +592,10 @@ end
 class System < EveDataCollection
   attr_accessor :id, :name, :region_id
 
+  def region
+    Region[@region_id]
+  end
+  
   @data = {}     ### System[] datastore
 
   include ImportSql
@@ -557,16 +615,22 @@ end
 class Station < EveDataCollection
   attr_accessor :id, :name, :sname, :href, :region_id, :system_id
 
+  def region
+    Region[@region_id]
+  end
+  def system
+    System[@system_id]
+  end
+
   @data = {}     ### Station[] datastore
-  # NOTE not all stations are listed in SDD
 
   STN_AMARR       = 60008494
   STN_JITA        = 60003760
   STN_DODIXIE     = 60011866
   @@nicknames = {
-    STN_AMARR   => "AMARR",
-    STN_JITA    => "JITA",
-    STN_DODIXIE => "DODIXIE",
+    STN_AMARR   => "*Amarr*",
+    STN_JITA    => "*Jita*",
+    STN_DODIXIE => "*Dodixie*",
   }
   def initialize(fields={})
     super(fields)
@@ -574,6 +638,7 @@ class Station < EveDataCollection
   end
 
   ### import from (i) Static Data Dump and (ii) Conquerable Station List
+  ### NOTE: not all stations are listed in SDD, so we also have to import Conquerable Station List
   include ImportSql
   @sdd_table     = "stastations"
   @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
@@ -585,38 +650,41 @@ class Station < EveDataCollection
     xml = REXML::Document.new(raw)
     xml.elements.each("eveapi/result/rowset/row") do |e| 
       #print e.attributes["stationID"] + " "
-      id = e.attributes["stationID"].to_i
-      name = e.attributes["stationName"]
-      sys = e.attributes["solarSystemID"].to_i
-      next if Station[id]
-      s = Station.new({id:id, name:name, system_id:sys, region_id:System[sys].region_id})
-      Station[id] = s
-      Station[name] = s
-      Region[id] = Region[s.region_id]
+      stn_id = e.attributes["stationID"].to_i
+      stn_name = e.attributes["stationName"]
+      system_id = e.attributes["solarSystemID"].to_i
+      region_id = System[system_id].region_id
+      next if Station[stn_id]  # we already know about this station
+      s = Station.new({id:stn_id, name:stn_name, system_id:system_id, region_id:region_id})
+      #Station[id] = s
+      #Station[name] = s
+      #Region[id] = Region[s.region_id]
     end
   end
   def self.import_deferred
     puts ">>> import_deferred()"
     import_csl
-    #exit
   end
   
   
-  def Station.hub?(x)
+  def Station.hub?(stn_id)
     lookup = {
       STN_AMARR   => true,
       STN_JITA    => true,
       STN_DODIXIE => true,
     }
-    lookup[x] 
+    lookup[stn_id] 
+  end
+  def hub?
+    Station.hub?(@id)
   end
 end
 
 
 ### DataCollections post-processing
-Station.each {|stn_id, stn| stn.region_id ||= System[stn.system_id].region_id}  ### Station[] - link region_id (for CSL adds)
-Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}             ### add Region[] index by Station id
-System.each  {|sys_id, sys| Region[sys_id] = Region[sys.region_id]}             ### add Region[] index by System id 
+#Station.each {|stn_id, stn| stn.region_id ||= System[stn.system_id].region_id}  ### Station[].region_id (for CSL entries)
+#Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}             ### add Region[] index by Station id
+#System.each  {|sys_id, sys| Region[sys_id] = Region[sys.region_id]}             ### add Region[] index by System id 
 
 
 
@@ -644,7 +712,6 @@ assert_eq(Region[name].id, id, "region DB: name lookup failed")
 
 
 
-
 ### Order class - EVE market order
 ### NOTE: data source could be Crest or Marketlogs
 class Order < EveDataCollection
@@ -655,7 +722,17 @@ class Order < EveDataCollection
     :station_id, :range, :region_id, \
     :issued, :duration, :sampled, \
     :ignore
-
+    
+  def item
+    Item[@item_id]
+  end
+  def station
+    Station[@station_id]
+  end
+  def region
+    Region[@region_id]
+  end
+  
   @data = {}    ### Order[] datastore
   
   def self.import_crest(i, sampled = Time.new(0))
@@ -702,18 +779,25 @@ end
 ###   sell_sampled = Time
 ### NOTE: need to be able to delete all orders for a particular region-item pair (when fresher data)
 class Market
-  attr_accessor :region, :item, :buy_orders, :sell_orders, :buy_sampled, :sell_sampled
-  def initialize(region, item)
-    @region = region
-    @item = item
+  attr_accessor :region_id, :item_id, :buy_orders, :sell_orders, :buy_sampled, :sell_sampled
+  def initialize(region_id, item_id)
+    @region_id = region_id
+    @item_id = item_id
     @buy_orders = []
     @sell_orders = []
     @buy_sampled = Time.new(0)
     @sell_sampled = Time.new(0)
   end
+  
+  def item
+    Item[@item_id]
+  end
+  def region
+    Region[@region_id]
+  end  
 end
 ## autovivify $markets[r] and $markets[r][i]
-$markets = Hash.new {|h1,region| h1[region] = Hash.new {|h2,item| h2[item] = Market.new(region, item)} } 
+$markets = Hash.new {|h1,rid| h1[rid] = Hash.new {|h2,iid| h2[iid] = Market.new(rid, iid)} } 
 
 
 
@@ -724,21 +808,17 @@ $markets = Hash.new {|h1,region| h1[region] = Hash.new {|h2,item| h2[item] = Mar
 class Evecentral < HTTPSource
   URL_BASE = "https://eve-central.com/home/tradefind_display.html"
   MAX_DELAY       = 48
-  MIN_PROFIT      = 1000
+  MIN_PROFIT      = 1000000
   MAX_SPACE       = 8967
   MAX_RESULTS     = 99999
   
   SYS_AMARR       = 30002187
   SYS_JITA        = 30000142
   SYS_DODIXIE     = 30002659
-
-  ### these stations are NOT in SDD!
-  ### "Y9-MDG V - Crow's Nest"
   REG_PROVIDENCE  = 10000047
-  SYS_Y9          = 30003734
-  ### "E-YCML IV - Lion's Den"
-  STN_EY          = 61000175
-  SYS_EY          = 30003732
+  REG_AMARR       = 10000043
+  REG_JITA        = 10000002
+  REG_DODIXIE     = 10000032
   
   def self.pretty(url)
     if url.match(URL_BASE) then
@@ -747,9 +827,9 @@ class Evecentral < HTTPSource
         SYS_JITA        => "Jita", 
         SYS_DODIXIE     => "Dodixie",
         REG_PROVIDENCE  => "Providence",
-        Region[SYS_AMARR].id => "Amarr",
-        Region[SYS_JITA].id => "Jita",
-        Region[SYS_DODIXIE].id => "Dodixie",
+        REG_AMARR       => "Amarr",
+        REG_JITA        => "Jita",
+        REG_DODIXIE     => "Dodixie",
       }
       sys_from = url.match("&fromt=([0-9]+)&")[1].to_i
       sys_to   = url.match("&to=([0-9]+)&")[1].to_i
@@ -821,7 +901,7 @@ class Evecentral < HTTPSource
       from = Station[m[:askLocation]].id
       to = Station[m[:bidLocation]].id
       item = m[:itemID].to_i
-      #next if !Station.hub?(from) || !Station.hub?(to)  ### hub stations only
+      #next if !from.hub? || !to.hub?  ### hub stations only
       trade = [from, to, item]
       trade_id = trade.join(":")
       trades[trade_id] = trade  ### filter out dups
@@ -886,13 +966,13 @@ class Evecentral < HTTPSource
   ### get_profitables(): get + parse list of profitable trades from evecentral
   ### return value: array of trade IDs (from_stn_id:to_stn_id:item_id)
   def self.get_profitables
-    #puts "Evecentral.get_profitables()"
-
-    ### get html from eve-central.com
+    ### get all route permutations between regions [Amarr, Jita, Dodixie, Providence]
     #hubs = [SYS_AMARR, SYS_JITA, SYS_DODIXIE]
     #urls = urls_all_routes_by_sys(hubs)
-    r = [Region[SYS_AMARR].id, Region[SYS_JITA].id, Region[SYS_DODIXIE].id, Evecentral::REG_PROVIDENCE]
+    r = [System[SYS_AMARR].region_id, System[SYS_JITA].region_id, System[SYS_DODIXIE].region_id, Evecentral::REG_PROVIDENCE]
     urls = urls_all_routes_by_reg(r)
+
+    ### get html from eve-central.com
     responses = mget(urls)
     $timers[:get] += (responses.max_by {|x| x.total_time}).total_time
 
@@ -1335,6 +1415,7 @@ class Marketlogs < HTTPSource
   
   ### import_orders() - check all marketlog files, import if more recent
   def self.import_orders
+    _start = Time.now
     #puts "Marketlogs.import_orders()"
     ### call this every 2 sec
     purge_old
@@ -1369,6 +1450,7 @@ class Marketlogs < HTTPSource
         end
       end
     end
+    puts "marketlogs imported #{Time.now - _start}s"
     update
   end
 
@@ -1395,7 +1477,7 @@ def prefetch(upto = 1028)
   mget_q << ['https://api.eveonline.com/eve/ConquerableStationList.xml.aspx', nil, nil]
   
   #mget_q << ['http://www.google.com', nil, nil]
-  #mget_q << ['https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30000142&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0', nil, nil]
+  #mget_q << ['https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30000142&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0', nil, nil]
   ### Phase 1: mget
   Crest.mget_ary(mget_q)
   if upto == 1 then return end
@@ -1406,26 +1488,28 @@ def prefetch(upto = 1028)
   mget_q = []
   ### Phase 2: eve-central profitables
   urls1 = [ ### 3 systems
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30000142&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30002659&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30000142&to=30002187&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30000142&to=30002659&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002659&to=30002187&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002659&to=30000142&qtype=Systems&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30000142&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002187&to=30002659&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=30000142&to=30002187&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=30000142&to=30002659&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002659&to=30002187&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=30002659&to=30000142&qtype=Systems&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
   ]
+
   urls1 = [ ### 4 regions
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000032&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000043&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000047&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000002&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000043&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000047&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000002&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000032&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000047&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000002&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000032&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
-  'https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000043&qtype=Regions&age=48&minprofit=1000&size=8967&limit=99999&sort=sprofit&prefer_sec=0',
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000032&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000032&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000043&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000002&to=10000047&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000002&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000043&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000032&to=10000047&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000002&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000032&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000043&to=10000047&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000002&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000032&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
+  "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000043&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
   ]
   # 10000002 The Forge (Jita)
   # 10000032 Sing Laison (Dodixie)
@@ -1658,6 +1742,7 @@ end   ### Trade class
 ### in: $markets, candidates
 ### out: trades
 def calc_trades(candidates)
+  _start = Time.now
   ### sort orders by price
   $markets.each_key do |reg|
     $markets[reg].each_key do |i|
@@ -1673,23 +1758,24 @@ def calc_trades(candidates)
   Trade.wipe  ### reset datastore
   candidates.each do |tuple|
     from_stn, to_stn, iid = tuple
-    from = Station[from_stn].region_id
-    to = Station[to_stn].region_id
     rt = "#{from_stn}:#{to_stn}"
     trades[rt]               ||= {}
     trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:Trade::K_SUM})
     trades[rt][iid]          ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:iid})
-    Trade[trades[rt][iid].id] = trades[rt][iid]  ### save to datastore
-    trades[rt][iid].asks = $markets[from][iid].sell_orders
-    trades[rt][iid].bids = $markets[to][iid].buy_orders
-    trades[rt][iid].age = [$markets[from][iid].sell_sampled, $markets[to][iid].buy_sampled].max  ### most recent
+    Trade[trades[rt][iid].id] = trades[rt][iid]  ### index datastore
+    ### market orders are stored by region (in $markets)
+    mkt_from = $markets[Station[from_stn].region_id][iid]
+    mkt_to   = $markets[Station[  to_stn].region_id][iid]
+    trades[rt][iid].asks = mkt_from.sell_orders.select {|o| o.station_id==from_stn}
+    trades[rt][iid].bids =   mkt_to.buy_orders.select {|o| o.station_id==to_stn}
+    trades[rt][iid].age = [mkt_from.sell_sampled, mkt_to.buy_sampled].max  ### most recent
   end
 
   net_tax = 0.9925  ### Accounting V
   min_profit = 1
   min_ppv = 1_000
   min_total_profit = 3_000_000
-  min_route_profit = 20_000_000
+  min_route_profit = 10_000_000
 
   ### match bids/asks
   ### iterate through all trades[route][item]
@@ -1734,13 +1820,11 @@ def calc_trades(candidates)
       t.ppv = t.profit / t.size
       t.roi = t.profit / t.cost
 
-      ### skip? check profit thresholds, known scams, etc.
+      ### skip item? check profit thresholds, known scams, etc.
       if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(iid); next end
       if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(iid); next end
-      if t.suspicious?                 then Trade.delete(t.id); trades[rt].delete(iid); next end
-      #if t.profit < min_total_profit  then trades[rt].delete(iid); next end
-      #if t.ppv < min_ppv              then trades[rt].delete(iid); next end
-      #if t.suspicious?                 then trades[rt].delete(iid); next end
+      if t.suspicious?                then Trade.delete(t.id); trades[rt].delete(iid); next end
+      ### TODO: Trade.ignore
       
       ### flag unprofitable orders
       ### loop exits on (a) first unprofitable match or (b) ran out of bids or asks
@@ -1755,36 +1839,70 @@ def calc_trades(candidates)
 
       ### add to route totals
       trades[rt][Trade::K_SUM] += t
-    end  ### each trade[rt][item]
-  end
+    end  ### each trade[rt][*iid*]
+    
+    ### check profit threshold for route in aggregate
+    if trades[rt][Trade::K_SUM].profit < min_route_profit then
+      ### wipe entire route
+      ### TODO: ignore instead?
+      trades[rt].each do |iid, t| Trade.delete(t.id); trades[rt].delete(iid) end
+      trades[rt].delete(Trade::K_SUM)
+      trades.delete(rt)
+    end
+  end     ### each trade[*rt*]
   
+  ### print routes
   routes_inc = trades.keys.sort_by {|rt| trades[rt][Trade::K_SUM].profit}
+  last_rt = nil
+  n = 0
   routes_inc.each do |rt|
+    n+=1
+    last_rt = rt
     from_stn, to_stn = rt.split(':')
-    from_stn = from_stn.to_i
-    to_stn = to_stn.to_i
-
-    ### print routes
+    from_stn = Station[from_stn.to_i]
+    to_stn = Station[to_stn.to_i]
     totals = trades[rt][Trade::K_SUM]
     next if totals.profit == 0 
     next if totals.profit < min_route_profit
-    puts "[#{Region[Station[from_stn].region_id].name}] #{Station[from_stn].sname}  =>  [#{Region[Station[to_stn].region_id].name}] #{Station[to_stn].sname}"
-    puts "=> $#{comma(totals.profit / 1_000_000.0)}M total, #{comma_i totals.size.to_i} m3"
+    #next unless from_stn.hub? or to_stn.hub?
+    
+    puts "#{n}. #{from_stn.sname}  =>  #{to_stn.sname}"
+    puts "=> $#{comma(totals.profit / 1_000_000.0)}M profit, #{comma_i totals.size.to_i} m3, #{'%.3f'%(totals.cost/1_000_000_000.0)}B cost"
     
     ### sort most profitable first
     sorted = trades[rt].values.sort do |a,b| b.profit <=> a.profit end 
     sorted.each do |t| 
       next if t.item == Trade::K_SUM 
-      puts "  $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
+      puts "    $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
       if t.profit > 100_000_000
         t.asks.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
         puts "    ---"
         t.bids.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
       end
     end
-    end  ### trades[route]
+  end  ### trades[route]
+  puts "calc_trades() #{'%.3f'%(Time.now - _start)}s"
+  
+  ### paste last route to clipboard
+  ### TODO: change the "fromID:toID" join string to object references!!! this is stupid
+  from_stn, to_stn = last_rt.split(':')
+  from_stn = Station[from_stn.to_i]
+  to_stn = Station[to_stn.to_i]
+  ### TODO: change these to object references
+  from_reg = Region[from_stn.region_id]
+  to_reg = Region[to_stn.region_id]
+  buf = "\n#{from_stn.sname} => #{to_stn.sname}\n\n"
+  sorted = trades[last_rt].values.sort do |a,b| b.profit <=> a.profit end 
+  sorted.each do |t| 
+    next if t.item == Trade::K_SUM 
+    buf << "#{Item[t.item].name}\n"
+  end
+  buf << "\n"
+  #puts "Copy to clipboard:\n#{buf}"
+  Clipboard.copy(buf)
+  puts "\a"   # beep
 
-    trades
+  trades
 end
 
 class WheatDB
@@ -1793,9 +1911,17 @@ class WheatDB
     @db = Mymysql.new(db_name)
   end
 
-  ### TODO: refactor $markets
-  def export_orders(markets)
-    Order.export_sql_table(@db, "orders")
+  def export_orders
+    touch = {}
+    Trade.each do |tid, t|
+      t.asks.each do |o| touch[o.id] = true end
+      t.bids.each do |o| touch[o.id] = true end
+    end
+    puts "#{touch.keys.size} orders pointed to by Trades"
+    n = 0
+    order_filter = Proc.new {|o| n+=1; touch[o.id]}
+    Order.export_sql_table(@db, "orders", order_filter)
+    puts "       orders #{'%.1f'%((n - touch.keys.size)*100.0/n)}% chaff (#{comma_i(n - touch.keys.size)})"
   end
   
   def export_trades
@@ -1844,7 +1970,7 @@ while 1
   ### export to DB: orders, trades, orders_trades
 	STDERR.puts "------------\n"
   db2 = WheatDB.new("wheat_development")
-  db2.export_orders($markets)
+  db2.export_orders
   db2.export_trades
   db2.export_orders_trades
 
