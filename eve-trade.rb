@@ -437,11 +437,11 @@ class EveDataCollection
     @data.delete(id)
   end
 
-  def ref_accessor(*id_syms)
+  def self.ref_accessor(*id_syms)
     id_syms.each do |id_sym|
       id_name = id_sym.to_s
       obj_name = id_name.chomp("_id")
-      klass = Object.get_const(obj_name.capitalize)
+      klass = Object.const_get(obj_name.capitalize)
       #obj_name = klass.to_s.downcase
       #id_name = obj_name + "_id"
 
@@ -449,11 +449,19 @@ class EveDataCollection
       attr_accessor id_sym
       ### object accessor
       out = "def #{obj_name};#{klass.to_s}[@#{id_name}];end" #debug
-      puts "accessor test>#{out}" #debug
-      klass.class_eval("def #{obj_name};#{klass.to_s}[@#{id_name}];end")
+      puts "ref_accessor()"
+      print "  klass="; pp klass
+      print "  self="; pp self
+      puts "  attr_accessor :#{id_sym}"
+      puts "  \"#{out}\"" #debug
+      x = self.class_eval("def #{obj_name};#{klass.to_s}[@#{id_name}];end")
+      print "  class_eval return="; pp x
+      #klass.class_eval("def #{obj_name};#{klass.to_s}[@#{id_name}];end")
     end
   end
 
+  ### deferred imports
+  #<class>.method(:<method_name>)
 end
 
 ### TEST
@@ -590,12 +598,16 @@ end
 ###   name
 ###   region_id
 class System < EveDataCollection
-  attr_accessor :id, :name, :region_id
+  ref_accessor  :region_id
+  attr_accessor :id, :name
 
+=begin
+  attr_accessor :id, :name, :region_id
   def region
     Region[@region_id]
   end
-  
+=end 
+ 
   @data = {}     ### System[] datastore
 
   include ImportSql
@@ -638,7 +650,6 @@ class Station < EveDataCollection
   end
 
   ### import from (i) Static Data Dump and (ii) Conquerable Station List
-  ### NOTE: not all stations are listed in SDD, so we also have to import Conquerable Station List
   include ImportSql
   @sdd_table     = "stastations"
   @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
@@ -649,23 +660,18 @@ class Station < EveDataCollection
     raw = (HTTPSource.get(url)).body
     xml = REXML::Document.new(raw)
     xml.elements.each("eveapi/result/rowset/row") do |e| 
-      #print e.attributes["stationID"] + " "
       stn_id = e.attributes["stationID"].to_i
       stn_name = e.attributes["stationName"]
       system_id = e.attributes["solarSystemID"].to_i
       region_id = System[system_id].region_id
       next if Station[stn_id]  # we already know about this station
       s = Station.new({id:stn_id, name:stn_name, system_id:system_id, region_id:region_id})
-      #Station[id] = s
-      #Station[name] = s
-      #Region[id] = Region[s.region_id]
     end
   end
   def self.import_deferred
     puts ">>> import_deferred()"
     import_csl
   end
-  
   
   def Station.hub?(stn_id)
     lookup = {
@@ -681,29 +687,30 @@ class Station < EveDataCollection
 end
 
 
-### DataCollections post-processing
-#Station.each {|stn_id, stn| stn.region_id ||= System[stn.system_id].region_id}  ### Station[].region_id (for CSL entries)
-#Station.each {|stn_id, stn| Region[stn_id] = Region[stn.region_id]}             ### add Region[] index by Station id
-#System.each  {|sys_id, sys| Region[sys_id] = Region[sys.region_id]}             ### add Region[] index by System id 
-
-
-
 
 
 ### Item test cases
 id = 28272
 vol = 10.0
 name = "'Augmented' Hammerhead"
-assert_eq(Item[id].name, name, "item DB: name info failed")
+assert_eq(Item[id].name, name,  "item DB: id lookup failed")
 assert_eq(Item[id].volume, vol, "item DB: volume info failed")
-assert_eq(Item[name].id, id, "item DB: name lookup failed")
+assert_eq(Item[name].id, id,    "item DB: name lookup failed")
 ### Station test cases
 id = 60000004
 name = "Muvolailen X - Moon 3 - CBD Corporation Storage"
 region = 10000033
-assert_eq(Station[id].name, name, "station DB: name info failed")
-assert_eq(Station[id].region_id, region, "station DB: region info failed")
-assert_eq(Station[name].id, id, "station DB: name lookup failed")
+assert_eq(Station[id].name, name,         "station DB: id lookup failed")
+assert_eq(Station[id].region_id, region,  "station DB: region info failed")
+assert_eq(Station[name].id, id,           "station DB: name lookup failed")
+### System test cases
+id = 30000142
+name = "Jita"
+region = 10000002
+assert_eq(System[id].name, name,        "system DB: id lookup failed")
+assert_eq(System[name].id,   id,        "system DB: name lookup failed")
+assert_eq(System[id].region.id, region, "system DB: region lookup failed")
+
 ### Region test cases
 id = 10000002
 name = "The Forge"
