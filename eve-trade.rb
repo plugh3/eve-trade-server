@@ -437,26 +437,21 @@ class EveDataCollection
     @data.delete(id)
   end
 
+  ### use this to add id reference to another EveData type
+  ### ex: "ref_accessor :region_id" adds methods for region_id() and region()
   def self.ref_accessor(*id_syms)
     id_syms.each do |id_sym|
-      id_name = id_sym.to_s
-      obj_name = id_name.chomp("_id")
-      klass = Object.const_get(obj_name.capitalize)
-      #obj_name = klass.to_s.downcase
-      #id_name = obj_name + "_id"
-
       ### id accessor
       attr_accessor id_sym
-      ### object accessor
-      out = "def #{obj_name};#{klass.to_s}[@#{id_name}];end" #debug
-      puts "ref_accessor()"
-      print "  klass="; pp klass
-      print "  self="; pp self
-      puts "  attr_accessor :#{id_sym}"
-      puts "  \"#{out}\"" #debug
-      x = self.class_eval("def #{obj_name};#{klass.to_s}[@#{id_name}];end")
-      print "  class_eval return="; pp x
-      #klass.class_eval("def #{obj_name};#{klass.to_s}[@#{id_name}];end")
+
+      ### object accessor (dynamically defined)
+      ### ex: def Station.region { Region[@region_id] }
+      id_name = id_sym.to_s
+      obj_name = id_name.chomp("_id")
+      ref_klass = Object.const_get(obj_name.capitalize)
+      #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end") ### also works
+      define_method(obj_name) do ref_klass[instance_variable_get("@#{id_name}")] end ### safer?
+      puts "ref_accessor(): #{self.to_s}.#{id_name}, #{self.to_s}.#{obj_name}=#{ref_klass.to_s}[@#{id_name}]"
     end
   end
 
@@ -464,13 +459,6 @@ class EveDataCollection
   #<class>.method(:<method_name>)
 end
 
-### TEST
-module ItemRef
-  attr_accessor :item_id
-  def item
-    Item[@item_id]
-  end
-end
 
 ### ImportSql module -- import DB table into EveDataCollection class datastore
 ### defined
@@ -598,16 +586,9 @@ end
 ###   name
 ###   region_id
 class System < EveDataCollection
-  ref_accessor  :region_id
   attr_accessor :id, :name
+  ref_accessor  :region_id
 
-=begin
-  attr_accessor :id, :name, :region_id
-  def region
-    Region[@region_id]
-  end
-=end 
- 
   @data = {}     ### System[] datastore
 
   include ImportSql
@@ -625,14 +606,8 @@ end
 ###   region_id
 ###   system_id (solar system)
 class Station < EveDataCollection
-  attr_accessor :id, :name, :sname, :href, :region_id, :system_id
-
-  def region
-    Region[@region_id]
-  end
-  def system
-    System[@system_id]
-  end
+  attr_accessor :id, :name, :sname, :href
+  ref_accessor  :region_id, :system_id
 
   @data = {}     ### Station[] datastore
 
@@ -649,7 +624,7 @@ class Station < EveDataCollection
     @sname = @@nicknames[@id] ? @@nicknames[@id] : @name  ### shortname
   end
 
-  ### import from (i) Static Data Dump and (ii) Conquerable Station List
+  ### two import sources: (i) Static Data Dump (SQL) and (ii) Conquerable Station List (XML)
   include ImportSql
   @sdd_table     = "stastations"
   @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
@@ -719,27 +694,13 @@ assert_eq(Region[name].id, id, "region DB: name lookup failed")
 
 
 
-### Order class - EVE market order
-### NOTE: data source could be Crest or Marketlogs
+### Order class - EVE market order (from Crest or Marketlogs)
 class Order < EveDataCollection
-  attr_accessor \
-    :id, :db_id, \
-    :item_id, :buy, :price, \
+  attr_accessor :id, :buy, :price, \
     :vol_rem, :vol_orig, :vol_min, \
-    :station_id, :range, :region_id, \
-    :issued, :duration, :sampled, \
-    :ignore
-    
-  def item
-    Item[@item_id]
-  end
-  def station
-    Station[@station_id]
-  end
-  def region
-    Region[@region_id]
-  end
-  
+    :range, :duration, :issued, :sampled, :ignore
+  ref_accessor  :item_id, :station_id, :region_id
+
   @data = {}    ### Order[] datastore
   
   def self.import_crest(i, sampled = Time.new(0))
@@ -787,6 +748,9 @@ end
 ### NOTE: need to be able to delete all orders for a particular region-item pair (when fresher data)
 class Market
   attr_accessor :region_id, :item_id, :buy_orders, :sell_orders, :buy_sampled, :sell_sampled
+  def region()  Region[@region_id] end
+  def item()    Item[@item_id]     end
+  
   def initialize(region_id, item_id)
     @region_id = region_id
     @item_id = item_id
@@ -794,14 +758,8 @@ class Market
     @sell_orders = []
     @buy_sampled = Time.new(0)
     @sell_sampled = Time.new(0)
-  end
-  
-  def item
-    Item[@item_id]
-  end
-  def region
-    Region[@region_id]
   end  
+
 end
 ## autovivify $markets[r] and $markets[r][i]
 $markets = Hash.new {|h1,rid| h1[rid] = Hash.new {|h2,iid| h2[iid] = Market.new(rid, iid)} } 
@@ -1657,16 +1615,17 @@ end
 
 
 class Trade < EveDataCollection
-  attr_accessor :id, :db_id
-  attr_accessor :from_stn, :to_stn, :item, :bids, :asks
-  attr_accessor :qty, :profit, :cost, :age, :size, :ppv, :roi
-
-  @@uid = 1
+  ref_accessor  :item_id
+  attr_accessor :id, :from_stn, :to_stn, :bids, :asks, \
+                :qty, :profit, :cost, :age, :size, :ppv, :roi
+  ### TODO: change from_stn/to_stn to _id/accessor format
   
-  @data = {}
+  @@uid = 1 
+  
+  @data = {}        ### Trade[] datastore
   K_SUM = 'totals'  ### special item_id for route totals
   def self.each
-    @data.values.uniq.each { |v| yield(v.id, v) unless v.item == K_SUM }  ### ignore K_SUM entries
+    @data.values.uniq.each { |v| yield(v.id, v) unless v.item_id == K_SUM }  ### ignore K_SUM entries
   end  
   def self.wipe
     @data = {}
@@ -1705,7 +1664,7 @@ class Trade < EveDataCollection
   def export_sql
     from_stn_e = Mysql2::Client.escape(Station[from_stn].sname)
     to_stn_e   = Mysql2::Client.escape(Station[to_stn].sname)
-    itemname_e = Mysql2::Client.escape(Item[item].name)
+    itemname_e = Mysql2::Client.escape(Item[item_id].name)
     "(#{id}, '#{from_stn_e}', '#{to_stn_e}', '#{itemname_e}', #{qty}, #{profit}, #{cost}, #{size}, #{ppv}, #{roi})"
   end
 
@@ -1723,13 +1682,13 @@ class Trade < EveDataCollection
     from = Station[from_stn].region_id
     to = Station[to_stn].region_id
     rt = "#{from}:#{to}"
-    asks = $markets[from][item].sell_orders
-    bids = $markets[to][item].buy_orders
+    asks = $markets[from][item_id].sell_orders
+    bids = $markets[to][item_id].buy_orders
     
-    if Item[item].name.match("^(Improved|Standard|Strong) .* Booster$")
+    if Item[item_id].name.match("^(Improved|Standard|Strong) .* Booster$")
       ### contraband
       true
-    elsif profit > 1_000_000_000 and known_scams[Item[item].name] then
+    elsif profit > 1_000_000_000 and known_scams[Item[item_id].name] then
       ### profit > 1B (scam)
       true
     elsif (bids[0].price - asks[0].price) > 29_000_000 and asks[0].price > 190_000_000
@@ -1767,8 +1726,8 @@ def calc_trades(candidates)
     from_stn, to_stn, iid = tuple
     rt = "#{from_stn}:#{to_stn}"
     trades[rt]               ||= {}
-    trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:Trade::K_SUM})
-    trades[rt][iid]          ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item:iid})
+    trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item_id:Trade::K_SUM})
+    trades[rt][iid]          ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item_id:iid})
     Trade[trades[rt][iid].id] = trades[rt][iid]  ### index datastore
     ### market orders are stored by region (in $markets)
     mkt_from = $markets[Station[from_stn].region_id][iid]
@@ -1879,8 +1838,8 @@ def calc_trades(candidates)
     ### sort most profitable first
     sorted = trades[rt].values.sort do |a,b| b.profit <=> a.profit end 
     sorted.each do |t| 
-      next if t.item == Trade::K_SUM 
-      puts "    $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
+      next if t.item_id == Trade::K_SUM 
+      puts "    $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item_id].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
       if t.profit > 100_000_000
         t.asks.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
         puts "    ---"
@@ -1901,8 +1860,8 @@ def calc_trades(candidates)
   buf = "\n#{from_stn.sname} => #{to_stn.sname}\n\n"
   sorted = trades[last_rt].values.sort do |a,b| b.profit <=> a.profit end 
   sorted.each do |t| 
-    next if t.item == Trade::K_SUM 
-    buf << "#{Item[t.item].name}\n"
+    next if t.item_id == Trade::K_SUM 
+    buf << "#{Item[t.item_id].name}\n"
   end
   buf << "\n"
   #puts "Copy to clipboard:\n#{buf}"
