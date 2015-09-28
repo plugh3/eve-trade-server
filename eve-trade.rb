@@ -434,8 +434,8 @@ class EveDataCollection
     @data.delete(id)
   end
 
-  ### use this to add _id reference to another EveData type
-  ### ex: "ref_accessor :region_id" adds methods for region_id() and region()
+  ### adds <EveData>_id references to other EveData types
+  ### usage: "ref_accessor :region_id" adds methods for region_id(r) and region()
   def self.ref_accessor(*id_syms)
     id_syms.each do |id_sym|
       ### id accessor
@@ -445,14 +445,20 @@ class EveDataCollection
       ### ex: def Station.region { Region[@region_id] }
       id_name = id_sym.to_s
       obj_name = id_name.chomp("_id")
-      ref_klass = Object.const_get(obj_name.capitalize)
-      #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end") ### also works
-      define_method(obj_name) do ref_klass[instance_variable_get("@#{id_name}")] end ### safer?
-      puts "ref_accessor(): #{self.to_s}: #{id_name}, #{obj_name}()"
+      obj_klass = Object.const_get(obj_name.capitalize)
+      #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end")   ### also works
+      define_method(obj_name) do obj_klass[instance_variable_get("@#{id_name}")] end    ### safer?
+      puts "ref_accessor(#{self.to_s}) :#{id_name}, :#{obj_name}()"
     end
   end
 
-  ### deferred imports
+  @@_deferred_imports = []
+  def self.register_deferred_import(m) 
+    @@_deferred_imports << m 
+  end
+  def self.import_deferred
+    @@_deferred_imports.each { |m| m.call }
+  end
   #<class>.method(:<method_name>)
 end
 
