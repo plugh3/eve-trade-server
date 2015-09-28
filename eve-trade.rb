@@ -81,11 +81,11 @@ class Cache
     if url.match("google")
       ret = nil
     elsif url.match("https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/") 
-      ret = nil
+      ret = 20
     elsif url.match("/market/types/") or url.match("/regions/") or url.match("^https://crest-tq.eveonline.com/$")
-      ret = 60*60
+      ret = 24*60*60
     elsif url.match("ConquerableStationList")
-      ret = 60*60
+      ret = 24*60*60
     elsif url.match("eve-central.com") 
       ret = 60  ### only need prefetch to carryover to actual fetch; see Cache.get() 
     ### server-defined TTLs
@@ -121,17 +121,17 @@ class Cache
     sys2sn[sys_from] + "-to-" + sys2sn[sys_to]
   end
 
-  ### TODO: find out why evecentral is not caching on the first get
-  # seems to be cached on 2nd get, carrying over to prefetch of next loop
   def self.set(k, v, exp)
     @@cache[k] = [v, exp]
-#    if k.match("eve-central.com") then puts "!!! caching #{pretty k}" end
   end
 
   def self.to_m(t)
+    h = (t/3600).to_i
+    t -= h*3600
     m = (t/60).to_i
-    s = (t - m*60).to_i
-    "#{'%02i'%m}:#{'%02i'%s}"
+    t -= m*60
+    s = (t).to_i
+    "#{'%02i'%h}:#{'%02i'%m}:#{'%02i'%s}"
   end
   
   def self.get(k, now=Time.now)
@@ -414,9 +414,6 @@ class EveDataCollection
   @data = {}
   def initialize(fields={})
     fields.each { |k,v| instance_variable_set("@#{k}", v) }
-    #puts "\ninitialize()"
-    #print "self>"; pp self
-    #print "fields>"; pp fields
     self.class[@id] = self
     self.class[@name] = self if @name
   end
@@ -451,7 +448,7 @@ class EveDataCollection
       ref_klass = Object.const_get(obj_name.capitalize)
       #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end") ### also works
       define_method(obj_name) do ref_klass[instance_variable_get("@#{id_name}")] end ### safer?
-      puts "ref_accessor(): #{self.to_s}.#{id_name}, #{self.to_s}.#{obj_name}=#{ref_klass.to_s}[@#{id_name}]"
+      puts "ref_accessor(): #{self.to_s}: #{id_name}, #{obj_name}()"
     end
   end
 
@@ -474,24 +471,19 @@ module ImportSql
   
     def import_sql(db_name, db_table, fieldmap)
       print "loading DB \"#{DB_SDD}.#{db_table}\"..."
-      start = Time.now
+      _start = Time.now
       ### query DB
       db = Mymysql.new(db_name)
       db_fields = fieldmap.keys.join(", ")
       sql = "SELECT #{db_fields} FROM #{db_table}"
       results = db.query(sql)
-      ### map fields and instantiate objects
       results.each do |src_row|
-        vals = {}
-        fieldmap.each { |k_src, k_dst| vals[k_dst] = src_row[k_src] }
-        #puts ""
-        #print "fieldmap>"; pp fieldmap
-        #print "vals>"; pp vals
-        #print "row>"; pp src_row
-        #puts #{results.size} rows"
-        x = self.new(vals) # instantiate by hash
+        ### map fields and instantiate objects
+        ivars = {}
+        fieldmap.each { |k_src, k_dst| ivars[k_dst] = src_row[k_src] }
+        x = self.new(ivars) # instantiate by hash
       end
-      puts "done (#{sz @data}, #{Time.now - start} sec)"
+      puts "done (#{sz @data}, #{Time.now - _start} sec)"
     end
 
     DB_SDD = "evesdd_galatea"
@@ -696,31 +688,59 @@ assert_eq(Region[name].id, id, "region DB: name lookup failed")
 
 ### Order class - EVE market order (from Crest or Marketlogs)
 class Order < EveDataCollection
+  ref_accessor  :item_id, :station_id, :region_id
   attr_accessor :id, :buy, :price, \
     :vol_rem, :vol_orig, :vol_min, \
     :range, :duration, :issued, :sampled, :ignore
-  ref_accessor  :item_id, :station_id, :region_id
-
-  @data = {}    ### Order[] datastore
+  #def item()    Item[@item_id]       end
+  #def station() Station[@station_id] end
+  #def region()  Region[@region_id]   end
   
-  def self.import_crest(i, sampled = Time.new(0))
-    o = Order.new({
-      :id         => i["id"],
-      :item_id    => i["type"]["id"],
-      :buy        => i["buy"],
-      :price      => i["price"].to_f,
-      :vol_rem    => i["volume"],
-      :vol_orig   => i["volumeEntered"],
-      :vol_min    => i["minVolume"],
-      :station_id => i["location"]["id"],
-      :range      => i["range"],
-      :region_id  => Station[i["location"]["id"]].region_id,
-      :issued     => DateTime.strptime(i["issued"], '%Y-%m-%dT%H:%M:%S').to_time.getutc,
-      :duration   => i["duration"],
+  @data = {}    ### Order[] datastore
+ 
+  ###
+  ### import/export conversions
+  ###
+  
+  ### import_crest() - converts Crest market order "item" into Order object
+  def self.import_crest_item(citem, sampled = Time.new(0))
+    Order.new({
+      :id         => citem["id"],
+      :item_id    => citem["type"]["id"],
+      :buy        => citem["buy"],
+      :price      => citem["price"].to_f,
+      :vol_rem    => citem["volume"],
+      :vol_orig   => citem["volumeEntered"],
+      :vol_min    => citem["minVolume"],
+      :station_id => citem["location"]["id"],
+      :range      => citem["range"],
+      :region_id  => Station[citem["location"]["id"]].region_id,
+      :issued     => DateTime.strptime(citem["issued"], '%Y-%m-%dT%H:%M:%S').to_time.getutc,
+      :duration   => citem["duration"],
       :sampled    => sampled,
     })
-    Order[o.id] = o
-    o
+  end
+
+  ### import_marketlog_line() - converts marketlog line into Order object
+  def self.import_marketlog_line(line, sample_time=Time.new(0))
+    price, vol_rem, item_id, range, order_id, vol_orig, vol_min, \
+      buy, issued, duration, station_id, region_id, system_id, jumps \
+      = line.split(',')
+    Order.new({
+      :id         => order_id.to_i, 
+      :item_id    => item_id.to_i, 
+      :buy        => (buy == "True"), 
+      :price      => price.to_f,
+      :vol_rem    => vol_rem.to_i, 
+      :vol_orig   => vol_orig.to_i, 
+      :vol_min    => vol_min.to_i,
+      :station_id => station_id.to_i, 
+      :region_id  => region_id.to_i,
+      :range      => range, 
+      :issued     => DateTime.strptime(issued, '%Y-%m-%d %H:%M:%S.%L').to_time.getutc,
+      :duration   => duration.to_i, 
+      :sampled    => sample_time,
+    })
   end
 
   def to_s
@@ -748,8 +768,8 @@ end
 ### NOTE: need to be able to delete all orders for a particular region-item pair (when fresher data)
 class Market
   attr_accessor :region_id, :item_id, :buy_orders, :sell_orders, :buy_sampled, :sell_sampled
-  def region()  Region[@region_id] end
-  def item()    Item[@item_id]     end
+  def region() Region[@region_id] end
+  def item()   Item[@item_id]     end
   
   def initialize(region_id, item_id)
     @region_id = region_id
@@ -850,7 +870,7 @@ class Evecentral < HTTPSource
     ### parse preamble
     re_preamble = Regexp.new(REGEXP_PREAMBLE)
     m = re_preamble.match(html)
-    nominal = m[1]
+    nominal = m[1]  ### number of profitables according to eve-central
 
     ### parse body (multiple blocks)
     trades = {}
@@ -959,17 +979,16 @@ end ### class Evecentral
 
 ### Crest - wrapper class for pulling market data from CCP authenticated CREST
 ### public interface
-###   import_orders
+###   import_orders()
 class Crest < HTTPSource
   URI_ROOT = 'https://crest-tq.eveonline.com/'
   URI_PATH_ITEMTYPES  = 'marketTypes'   ### "/marketTypes/"
   URI_PATH_REGIONS    = 'regions'       ### "/regions/"
   URL_AUTH = "https://login-tq.eveonline.com/oauth/token/"
-  #auth_url = "https://login.eveonline.com/oauth/token"
   RE_MARKET = "https://crest-tq\\.eveonline\\.com/market/[0-9]{8}/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/[0-9]+/"
 
-  @@client_id = 'e5a122800a134da2ad4b0e01664b627b'  ### app ID (secret key is passed by command line)
-  @@client_rtoken = '2-X4wdpBzGMTkpy8bdk0jg-gi6YfwVWyp_G9PbJtAME1' ### app refresh token
+  @@client_id = 'e5a122800a134da2ad4b0e01664b627b'  ### app's ID (secret key is passed by command line)
+  @@client_rtoken = '2-X4wdpBzGMTkpy8bdk0jg-gi6YfwVWyp_G9PbJtAME1'  ### app's refresh token
 
   @@crest_http_opts = Hash.new
   @@crest_http_opts[:followlocation]   = true
@@ -1034,9 +1053,6 @@ class Crest < HTTPSource
     if (!defined?(@@access_token)) || (Time.now > @@access_expire) then _refresh_atoken end
     @@access_token
   end
-  def self.singleton
-    self
-  end
 
   def self.http_opts
     @@crest_http_opts
@@ -1083,6 +1099,7 @@ class Crest < HTTPSource
   #  json = JSON.parse(r.body)
   #end
 
+  
   ### get_href_as_items() - returns href response as array of json "items"
   def self.get_href_as_items(href)
     responses = get_href(href)
@@ -1144,7 +1161,6 @@ class Crest < HTTPSource
   end
   
  
-  
   ### load_regions() - populate Region[].href from Crest
   def self._load_region_hrefs
     items = get_href_as_items(_href_regions)
@@ -1184,29 +1200,7 @@ class Crest < HTTPSource
     _load_itemtype_hrefs  # Item[].href
     @@_static_loaded = true
   end
-
   
-  ### converts Crest market order "item" to Order object
-  def self.import_crest_order(i, sampled = Time.new(0))
-    o = Order.new({
-      :id         => i["id"],
-      :item_id    => i["type"]["id"],
-      :buy        => i["buy"],
-      :price      => i["price"].to_f,
-      :vol_rem    => i["volume"],
-      :vol_orig   => i["volumeEntered"],
-      :vol_min    => i["minVolume"],
-      :station_id => i["location"]["id"],
-      :range      => i["range"],
-      :region_id  => Station[i["location"]["id"]].region_id,
-      :issued     => DateTime.strptime(i["issued"], '%Y-%m-%dT%H:%M:%S').to_time.getutc,
-      :duration   => i["duration"],
-      :sampled    => sampled,
-    })
-    Order[o.id] = o
-    o
-  end
-
   ### get_market_orders() - returns href and callback for market order fetch
   ### branched for two flavors (buy and sell)
   def self._get_market_orders(region, item, now, buy)
@@ -1221,7 +1215,7 @@ class Crest < HTTPSource
       proc = Proc.new do |response|
         items = (JSON.parse(response.body))["items"]
         $counters[:size] += response.body.size
-        orders = items.map { |i| import_crest_order(i, sampled) }
+        orders = items.map { |i| Order.import_crest_item(i, sampled) }
         m.instance_variable_set(buy ? '@buy_orders' : '@sell_orders', orders)
         m.instance_variable_set(buy ? '@buy_sampled' : '@sell_sampled', now)
         #puts ">>> crest #{buy ? 'buy ' : 'sell'} #{'%-11s' % r.name}::#{i.name}  #{now}"
@@ -1245,29 +1239,16 @@ class Crest < HTTPSource
     procs = {}
     now = Time.now.getutc
     trades.each do |t|
-      from_stn, to_stn, item = t
-      if not Station[from_stn.to_i].region_id then puts "\"from\" station.region #{from_stn} not found" end
-      if not Station[to_stn.to_i].region_id   then 
-        puts "\"to\" station.region #{to_stn} not found" 
-        stn_id = to_stn.to_i
-        stn = Station[stn_id]
-        sys_id = stn.system_id
-        sys = System[sys_id]
-        
-        puts ">>> PROBLEM Station \##{stn_id} in System \##{sys_id}"
-        pp stn
-        pp sys
-      end
-      from = Station[from_stn.to_i].region_id
-      to = Station[to_stn.to_i].region_id
-      item = item.to_i
+      from_sid, to_sid, item = t
+      from_r = Station[from_sid].region_id
+      to_r =   Station[  to_sid].region_id
       
       ### get sell orders
-      href, proc = _get_market_sell_orders(from, item, now)
+      href, proc = _get_market_sell_orders(from_r, item, now)
       hrefs << href if href
       procs[href] = proc if href
       ### get buy orders
-      href, proc = _get_market_buy_orders(to, item, now)
+      href, proc = _get_market_buy_orders(to_r, item, now)
       next if href == nil
       hrefs << href
       procs[href] = proc
@@ -1301,30 +1282,6 @@ class Marketlogs < HTTPSource
     [region_id, item_id, sample_time]
   end
 
-  ### import_line() - converts marketlog row into Order object
-  def self.import_line(line, sample_time=Time.new(0))
-    price, vol_rem, item_id, range, order_id, vol_orig, vol_min, \
-      buy, issued, duration, station_id, region_id, system_id, jumps \
-      = line.split(',')
-    o = Order.new({
-      :id         => order_id.to_i, 
-      :item_id    => item_id.to_i, 
-      :buy        => (buy == "True"), 
-      :price      => price.to_f,
-      :vol_rem    => vol_rem.to_i, 
-      :vol_orig   => vol_orig.to_i, 
-      :vol_min    => vol_min.to_i,
-      :station_id => station_id.to_i, 
-      :region_id  => region_id.to_i,
-      :range      => range, 
-      :issued     => DateTime.strptime(issued, '%Y-%m-%d %H:%M:%S.%L').to_time.getutc,
-      :duration   => duration.to_i, 
-      :sampled    => sample_time,
-    })
-    Order[o.id] = o
-    o
-  end
-  
   def self.import_file(fname)
     region_id, item_id, sample_time = file_attrs(fname)
     file = File.new(fname, "r")
@@ -1332,7 +1289,7 @@ class Marketlogs < HTTPSource
     #header = "price,volRemaining,typeID,range,orderID,volEntered,minVolume,bid,issueDate,duration,stationID,regionID,solarSystemID,jumps,"
     orders = []
     while line = file.gets
-      orders << import_line(line, sample_time)
+      orders << Order.import_marketlog_line(line, sample_time)
     end
     file.close
     orders
@@ -1616,9 +1573,11 @@ end
 
 class Trade < EveDataCollection
   ref_accessor  :item_id
-  attr_accessor :id, :from_stn, :to_stn, :bids, :asks, \
+  attr_accessor :id, :from_sid, :to_sid, :bids, :asks, \
                 :qty, :profit, :cost, :age, :size, :ppv, :roi
   ### TODO: change from_stn/to_stn to _id/accessor format
+  def from() Station[@from_stn_id] end
+  def to()   Station[@to_stn_id]   end
   
   @@uid = 1 
   
@@ -1662,9 +1621,9 @@ class Trade < EveDataCollection
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
   def export_sql
-    from_stn_e = Mysql2::Client.escape(Station[from_stn].sname)
-    to_stn_e   = Mysql2::Client.escape(Station[to_stn].sname)
-    itemname_e = Mysql2::Client.escape(Item[item_id].name)
+    from_stn_e = Mysql2::Client.escape(from.sname)
+    to_stn_e   = Mysql2::Client.escape(to.sname)
+    itemname_e = Mysql2::Client.escape(item.name)
     "(#{id}, '#{from_stn_e}', '#{to_stn_e}', '#{itemname_e}', #{qty}, #{profit}, #{cost}, #{size}, #{ppv}, #{roi})"
   end
 
@@ -1679,16 +1638,16 @@ class Trade < EveDataCollection
       "Raysere's Modified Mega Beam Laser" => true,
     }
 
-    from = Station[from_stn].region_id
-    to = Station[to_stn].region_id
-    rt = "#{from}:#{to}"
-    asks = $markets[from][item_id].sell_orders
-    bids = $markets[to][item_id].buy_orders
+    from_r = from.region_id
+    to_r = to.region_id
+    rt = "#{from_r}:#{to_r}"
+    asks = $markets[from_r][item_id].sell_orders
+    bids = $markets[to_r][item_id].buy_orders
     
-    if Item[item_id].name.match("^(Improved|Standard|Strong) .* Booster$")
+    if item.name.match("^(Improved|Standard|Strong) .* Booster$")
       ### contraband
       true
-    elsif profit > 1_000_000_000 and known_scams[Item[item_id].name] then
+    elsif profit > 1_000_000_000 and known_scams[item.name] then
       ### profit > 1B (scam)
       true
     elsif (bids[0].price - asks[0].price) > 29_000_000 and asks[0].price > 190_000_000
@@ -1723,33 +1682,29 @@ def calc_trades(candidates)
               ### trades{route_id}{Trade::K_SUM} => route totals
   Trade.wipe  ### reset datastore
   candidates.each do |tuple|
-    from_stn, to_stn, iid = tuple
-    rt = "#{from_stn}:#{to_stn}"
+    from_sid, to_sid, iid = tuple
+    rt = [from_sid, to_sid]
     trades[rt]               ||= {}
-    trades[rt][Trade::K_SUM] ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item_id:Trade::K_SUM})
-    trades[rt][iid]          ||= Trade.new({from_stn:from_stn, to_stn:to_stn, item_id:iid})
-    Trade[trades[rt][iid].id] = trades[rt][iid]  ### index datastore
-    ### market orders are stored by region (in $markets)
-    mkt_from = $markets[Station[from_stn].region_id][iid]
-    mkt_to   = $markets[Station[  to_stn].region_id][iid]
-    trades[rt][iid].asks = mkt_from.sell_orders.select {|o| o.station_id==from_stn}
-    trades[rt][iid].bids =   mkt_to.buy_orders.select {|o| o.station_id==to_stn}
+    trades[rt][Trade::K_SUM] ||= Trade.new({from_stn_id:from_sid, to_stn_id:to_sid, item_id:Trade::K_SUM})
+    trades[rt][iid]          ||= Trade.new({from_stn_id:from_sid, to_stn_id:to_sid, item_id:iid})
+    ### market orders are by region, so filter by station
+    mkt_from = $markets[Station[from_sid].region_id][iid]
+    mkt_to   = $markets[Station[  to_sid].region_id][iid]
+    trades[rt][iid].asks = mkt_from.sell_orders.select {|o| o.station_id==from_sid}
+    trades[rt][iid].bids =   mkt_to.buy_orders.select  {|o| o.station_id==to_sid}
     trades[rt][iid].age = [mkt_from.sell_sampled, mkt_to.buy_sampled].max  ### most recent
   end
 
-  net_tax = 0.9925  ### Accounting V
+  net_tax = 0.9925  ### Accounting skill level 5
   min_profit = 1
   min_ppv = 1_000
   min_total_profit = 3_000_000
-  min_route_profit = 10_000_000
+  min_route_profit = 20_000_000
 
   ### match bids/asks
   ### iterate through all trades[route][item]
   puts "------------\n"
   trades.each_key do |rt| 
-    from_stn, to_stn = rt.split(':')
-    from_stn = from_stn.to_i
-    to_stn = to_stn.to_i
     trades[rt].each do |iid, t|
       next if iid == Trade::K_SUM
       asks = t.asks
@@ -1778,8 +1733,9 @@ def calc_trades(candidates)
         t.qty += qty
         t.cost += qty * ask.price
       end  ### match bids/asks
-      if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(iid); next end ### no matches
-      #if (i_ask == 0 and i_bid == 0) then trades[rt].delete(iid); next end ### no matches
+
+      ### skip if no profitable matches
+      if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(iid); next end
 
       ### derived calcs
       t.size = t.qty * Item[iid].volume
@@ -1824,9 +1780,9 @@ def calc_trades(candidates)
   routes_inc.each do |rt|
     n+=1
     last_rt = rt
-    from_stn, to_stn = rt.split(':')
-    from_stn = Station[from_stn.to_i]
-    to_stn = Station[to_stn.to_i]
+    from_sid, to_sid = rt
+    from_stn = Station[from_sid]
+    to_stn = Station[to_sid]
     totals = trades[rt][Trade::K_SUM]
     next if totals.profit == 0 
     next if totals.profit < min_route_profit
@@ -1851,12 +1807,10 @@ def calc_trades(candidates)
   
   ### paste last route to clipboard
   ### TODO: change the "fromID:toID" join string to object references!!! this is stupid
-  from_stn, to_stn = last_rt.split(':')
-  from_stn = Station[from_stn.to_i]
-  to_stn = Station[to_stn.to_i]
+  from_sid, to_sid = last_rt
+  from_stn = Station[from_sid]
+  to_stn = Station[to_sid]
   ### TODO: change these to object references
-  from_reg = Region[from_stn.region_id]
-  to_reg = Region[to_stn.region_id]
   buf = "\n#{from_stn.sname} => #{to_stn.sname}\n\n"
   sorted = trades[last_rt].values.sort do |a,b| b.profit <=> a.profit end 
   sorted.each do |t| 
@@ -1883,7 +1837,6 @@ class WheatDB
       t.asks.each do |o| touch[o.id] = true end
       t.bids.each do |o| touch[o.id] = true end
     end
-    puts "#{touch.keys.size} orders pointed to by Trades"
     n = 0
     order_filter = Proc.new {|o| n+=1; touch[o.id]}
     Order.export_sql_table(@db, "orders", order_filter)
@@ -1908,10 +1861,10 @@ class WheatDB
       t.asks.each do |o| q << "(#{o.id}, #{t.id})"; n+=1 end
       t.bids.each do |o| q << "(#{o.id}, #{t.id})"; n+=1 end
     end
-    timer2 = Time.now - start2
+    t_str = Time.now - start2
     q.flush
     t_ins = Time.now - start
-    puts "INSERT orders_trades x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%timer2}s, ins #{'%.3f'%(t_ins-t_del)}s)"
+    puts "INSERT orders_trades x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_ins-t_del)}s)"
   end
 end
 
