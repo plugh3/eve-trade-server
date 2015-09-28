@@ -403,10 +403,10 @@ end
 
 
 ### EveDataCollection -- base wrapper class for Eve game data
-### objects instantiated by hash of instance variable name-value pairs
-### subclassed for each data type (Item, Region, Station)
-### instance is a single data element
-### class is hash of all instances indexed by ID and name, eg...
+### objects instantiated by hash of (instance variable) name-value pairs
+### subclassed for each data type (Item, Region, Station, etc)
+### an instance is a single data element
+### class is a hash of all instances indexed by ID and name, eg...
 ###   Item[id]
 ###   Region[name]
 ###   Station.each
@@ -434,7 +434,7 @@ class EveDataCollection
     @data.delete(id)
   end
 
-  ### use this to add id reference to another EveData type
+  ### use this to add _id reference to another EveData type
   ### ex: "ref_accessor :region_id" adds methods for region_id() and region()
   def self.ref_accessor(*id_syms)
     id_syms.each do |id_sym|
@@ -977,7 +977,7 @@ end ### class Evecentral
 
 
 
-### Crest - wrapper class for pulling market data from CCP authenticated CREST
+### Crest - wrapper class for pulling market data from CCP's authenticated CREST API
 ### public interface
 ###   import_orders()
 class Crest < HTTPSource
@@ -1132,7 +1132,6 @@ class Crest < HTTPSource
     
     mget(hrefs, opts, blocks)
   end
-
 
   
 
@@ -1575,9 +1574,8 @@ class Trade < EveDataCollection
   ref_accessor  :item_id
   attr_accessor :id, :from_sid, :to_sid, :bids, :asks, \
                 :qty, :profit, :cost, :age, :size, :ppv, :roi
-  ### TODO: change from_stn/to_stn to _id/accessor format
-  def from() Station[@from_stn_id] end
-  def to()   Station[@to_stn_id]   end
+  def from() Station[@from_sid] end
+  def to()   Station[@to_sid]   end
   
   @@uid = 1 
   
@@ -1621,6 +1619,7 @@ class Trade < EveDataCollection
     "(trade_id, from_stn, to_stn, item, qty, profit, cost, size, ppv, roi)"
   end
   def export_sql
+    ### TODO: esc = method...
     from_stn_e = Mysql2::Client.escape(from.sname)
     to_stn_e   = Mysql2::Client.escape(to.sname)
     itemname_e = Mysql2::Client.escape(item.name)
@@ -1638,12 +1637,8 @@ class Trade < EveDataCollection
       "Raysere's Modified Mega Beam Laser" => true,
     }
 
-    from_r = from.region_id
-    to_r = to.region_id
-    rt = "#{from_r}:#{to_r}"
-    asks = $markets[from_r][item_id].sell_orders
-    bids = $markets[to_r][item_id].buy_orders
-    
+    asks = $markets[from.region_id][item_id].sell_orders
+    bids = $markets[to.region_id][item_id].buy_orders
     if item.name.match("^(Improved|Standard|Strong) .* Booster$")
       ### contraband
       true
@@ -1685,8 +1680,8 @@ def calc_trades(candidates)
     from_sid, to_sid, iid = tuple
     rt = [from_sid, to_sid]
     trades[rt]               ||= {}
-    trades[rt][Trade::K_SUM] ||= Trade.new({from_stn_id:from_sid, to_stn_id:to_sid, item_id:Trade::K_SUM})
-    trades[rt][iid]          ||= Trade.new({from_stn_id:from_sid, to_stn_id:to_sid, item_id:iid})
+    trades[rt][Trade::K_SUM] ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:Trade::K_SUM})
+    trades[rt][iid]          ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:iid})
     ### market orders are by region, so filter by station
     mkt_from = $markets[Station[from_sid].region_id][iid]
     mkt_to   = $markets[Station[  to_sid].region_id][iid]
