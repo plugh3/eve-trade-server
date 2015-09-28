@@ -1,13 +1,13 @@
-require 'typhoeus'
+### install
 require 'typhoeus'
 require 'mysql2'
+require 'clipboard'
 require 'json'
+### sys
 require 'base64'
 require 'stringio'
 require 'pp'
-#require 'net/http'
 require 'rexml/document'
-require 'clipboard'
 
 ### global variables
 $timers = Hash.new(0)
@@ -799,7 +799,7 @@ $markets = Hash.new {|h1,rid| h1[rid] = Hash.new {|h2,iid| h2[iid] = Market.new(
 class Evecentral < HTTPSource
   URL_BASE = "https://eve-central.com/home/tradefind_display.html"
   MAX_DELAY       = 48
-  MIN_PROFIT      = 1000000
+  MIN_PROFIT      = 100000
   MAX_SPACE       = 8967
   MAX_RESULTS     = 99999
   
@@ -1342,6 +1342,7 @@ class Marketlogs < HTTPSource
   
   ### import_orders() - check all marketlog files, import if more recent
   def self.import_orders
+    if not Dir.exists?(EXPORT_DIR) then puts "Marketlogs: directory not found #{EXPORT_DIR}"; return false; end
     _start = Time.now
     #puts "Marketlogs.import_orders()"
     ### call this every 2 sec
