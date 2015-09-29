@@ -884,16 +884,14 @@ class Evecentral < HTTPSource
     start_parse = Time.new
     n = $counters[:profitables]
     while (m = re_block.match(m.post_match)) do
-      
       $counters[:profitables] += 1
-      if (not Station[m[:askLocation]] or not Station[m[:bidLocation]]) then
-        puts "#{m[:askLocation]} => #{m[:bidLocation]}"
-      end
-      from = Station[m[:askLocation]].id
-      to = Station[m[:bidLocation]].id
-      item = m[:itemID].to_i
+      assert(Station[m[:askLocation]], "Evecentral.import_html(): station not found #{m[:askLocation]}")
+      assert(Station[m[:bidLocation]], "Evecentral.import_html(): station not found #{m[:bidLocation]}")
+      from_sid = Station[m[:askLocation]].id
+      to_sid = Station[m[:bidLocation]].id
+      item_id = m[:itemID].to_i
       #next if !from.hub? || !to.hub?  ### hub stations only
-      trade = [from, to, item]
+      trade = [from_sid, to_sid, item_id]
       trade_id = trade.join(":")
       trades[trade_id] = trade  ### filter out dups
     end 
@@ -904,37 +902,28 @@ class Evecentral < HTTPSource
     trades.values
   end
 
-
+  def self.url_gen(from, to, qtype)
+    params = \
+      "?set=1" + \
+      "&fromt=#{from}" + \
+      "&to=#{to}" + \
+      "&qtype=#{qtype}" + \
+      "&age=#{MAX_DELAY}" + \
+      "&minprofit=#{MIN_PROFIT}" + \
+      "&size=#{MAX_SPACE}" + \
+      "&limit=#{MAX_RESULTS}" + \
+      "&sort=sprofit" + \
+      "&prefer_sec=0"
+    url = URL_BASE + params
+  end
   def self.url_by_sys(from_sys, to_sys)
-    params = \
-      "?set=1" + \
-      "&fromt=#{from_sys}" + \
-      "&to=#{to_sys}" + \
-      "&qtype=Systems" + \
-      "&age=#{MAX_DELAY}" + \
-      "&minprofit=#{MIN_PROFIT}" + \
-      "&size=#{MAX_SPACE}" + \
-      "&limit=#{MAX_RESULTS}" + \
-      "&sort=sprofit" + \
-      "&prefer_sec=0"
-    url = URL_BASE + params
+    url_gen(from_sys, to_sys, "Systems")
+  end
+    def self.url_by_reg(from_r, to_r)
+    url_gen(from_r, to_r, "Regions")
   end
   
-  def self.url_by_reg(from_r, to_r)
-    params = \
-      "?set=1" + \
-      "&fromt=#{from_r}" + \
-      "&to=#{to_r}" + \
-      "&qtype=Regions" + \
-      "&age=#{MAX_DELAY}" + \
-      "&minprofit=#{MIN_PROFIT}" + \
-      "&size=#{MAX_SPACE}" + \
-      "&limit=#{MAX_RESULTS}" + \
-      "&sort=sprofit" + \
-      "&prefer_sec=0"
-    url = URL_BASE + params
-  end
-  
+  ### all route permutations
   def self.urls_all_routes_by_sys(x)
     urls = []
     x.each do |from|
@@ -1077,11 +1066,11 @@ class Crest < HTTPSource
     opts = Hash.new(opt)
     
     p1_response = get(href, opt)
-    responses = [p1_response]
+    ret = [p1_response]
 
     ### check for multi-page response
     ### technically we're supposed to iterate through each "next" link one at a time (for marketTypes takes 50s)
-    ### instead we do a parallel get of pages 2-N (2x faster for for marketTypes)
+    ### instead we do a parallel get of pages 2-N (much faster)
     p1_json = JSON.parse(p1_response.body)
     if (p1_json["pageCount"] and p1_json["pageCount"] > 1) then
       ### parallel multi-get: hack URIs for pages 2-n
@@ -1091,10 +1080,10 @@ class Crest < HTTPSource
       m = p2_href.match("page=2")
       hrefs = (2..n_pages).map {|x| m.pre_match + "page=" + x.to_s + m.post_match}
       responses_2_to_n = mget(hrefs, opts) 
-      responses.concat(responses_2_to_n)
+      ret.concat(responses_2_to_n)
     end
 
-    responses
+    ret
   end
   ### alternate implementation: for multi-page responses, follow "next" links one at a time (CREST-compliant)
   #json = p1_json
@@ -1171,7 +1160,8 @@ class Crest < HTTPSource
     items = get_href_as_items(_href_regions)
     items.each { |i| Region[i["name"]].href = i["href"] }
   end
-  ### load_markets() - populate Region[].buy_href, .sell_href (assumes Region.href is loaded)
+  ### load_markets() - fetch values for Region[].buy_href and .sell_href 
+  ### prereq - assumes Region[].href is already defined
   ### NOTE: ~100 GETs 
   def self._load_market_hrefs
     hrefs = []
@@ -1188,14 +1178,14 @@ class Crest < HTTPSource
     get_hrefs_each(hrefs, blocks)
   end
   ### load_items() - populate Item[].href
-  ### NOTE: Crest might have "new" items not seen in static data dump
+  ### NOTE: Crest might have "new" items not seen in import
   def self._load_itemtype_hrefs
     items = get_href_as_items(_href_item_types)
     items.each do |i|
       id = i["type"]["id"]
-      if not Item[id] then Item[id] = Item.new({id:id, name:i["type"]["name"], volume: 1.0}) end
+      Item[id] ||= Item.new({id:id, name:i["type"]["name"], volume: 1.0})
       Item[id].href = i["type"]["href"]
-      assert_eq(Item[id].name, i["type"]["name"], "item DB mismatch name")  ### test
+      assert_eq(Item[id].name, i["type"]["name"], "item DB name mismatch")  ### test
     end
   end
   ### _load_static_data() - fetch hrefs for Region and Item (prereq to fetching market orders)
@@ -1208,12 +1198,12 @@ class Crest < HTTPSource
   
   ### get_market_orders() - returns href and callback for market order fetch
   ### branched for two flavors (buy and sell)
-  def self._get_market_orders(region, item, now, buy)
+  def self._get_market_orders(region_id, item_id, now, buy)
     _load_static_data unless @@_static_loaded
-    r = Region[region]
-    assert(r, "bad index Region[#{region}]")
-    i = Item[item]
-    m = $markets[region][item]
+    r = Region[region_id]
+    assert(r, "bad index Region[#{region_id}]")
+    i = Item[item_id]
+    m = $markets[region_id][item_id]
     sampled = buy ? m.buy_sampled : m.sell_sampled
     if now > sampled 
       href = (buy ? r.buy_href : r.sell_href) + "?type=" + i.href
@@ -1237,7 +1227,7 @@ class Crest < HTTPSource
     _get_market_orders(from, item, now, false)
   end
 
-  ### import_orders() - fetch market orders; populate $markets[region][item].buy_orders
+  ### import_orders() - fetch market orders; populate $markets[][].buy_orders, .sell_orders
   def self.import_orders(trades)
     #puts "Crest.import_orders()"
     hrefs = []
@@ -1254,9 +1244,8 @@ class Crest < HTTPSource
       procs[href] = proc if href
       ### get buy orders
       href, proc = _get_market_buy_orders(to_r, item, now)
-      next if href == nil
-      hrefs << href
-      procs[href] = proc
+      hrefs << href unless href==nil
+      procs[href] = proc unless href==nil
     end
     hrefs.uniq!
     responses = Crest.get_hrefs_each(hrefs, procs) ### multi-get
@@ -1282,7 +1271,8 @@ class Marketlogs < HTTPSource
     m = fname.match(EXPORT_FNAME_REGEXP)
     assert(m, "marketlog filename #{fname}")
     region_id = Region[m[:region]].id
-    item_id = Item[ @@fname2name[m[:item]] || m[:item] ].id
+    item_name = @@fname2name[m[:item]] || m[:item]  ### some item filenames are modified
+    item_id = Item[item_name].id
     sample_time = Time.utc(m[:yr], m[:mo], m[:dy], m[:hh], m[:mm], m[:ss]) + EXPORT_TRUMP_TIME
     [region_id, item_id, sample_time]
   end
@@ -1318,17 +1308,16 @@ class Marketlogs < HTTPSource
       region_id, item_id, me_sampled = Marketlogs.file_attrs(me_fname)
       mkt_id = [region_id, item_id].join(":")
 
-      if Time.now - me_sampled > EXPORT_TTL     # past expiration so delete
+      if Time.now - me_sampled > EXPORT_TTL     # past expiration so delete me
           puts "!!! deleting marketlog expired #{me_fname}"
           File.delete(me_fname)
           next
       end
-      
       if latest_fnames[mkt_id]
-        if me_sampled < latest_times[mkt_id]      # less recent so delete
+        if me_sampled < latest_times[mkt_id]      # less recent so delete me
           puts "!!! deleting marketlog overtaken #{me_fname}"
           File.delete(me_fname)
-          next
+          next  ### current file deleted
         elsif me_sampled > latest_times[mkt_id]   # more recent so delete other
           puts "!!! deleting marketlog overtaken #{latest_fnames[mkt_id]}"
           File.delete(latest_fnames[mkt_id])
@@ -1392,7 +1381,7 @@ end ### class Marketlogs
 
 def prefetch(upto = 1028)
   prefetch_start = Time.now
-  
+  puts ">>> prefetch.start <<<"
   ###
   ### Phase 1
   ###
@@ -1439,10 +1428,6 @@ def prefetch(upto = 1028)
   "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000032&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
   "https://eve-central.com/home/tradefind_display.html?set=1&fromt=10000047&to=10000043&qtype=Regions&age=#{Evecentral::MAX_DELAY}&minprofit=#{Evecentral::MIN_PROFIT}&size=#{Evecentral::MAX_SPACE}&limit=#{Evecentral::MAX_RESULTS}&sort=sprofit&prefer_sec=0",
   ]
-  # 10000002 The Forge (Jita)
-  # 10000032 Sing Laison (Dodixie)
-  # 10000043 Domain (Amarr)
-  # 10000047 Providence
 
   urls1.each do |url| mget_q << [url, nil, nil] end
   ### Phase 2: Crest root, regions, itemtypes
@@ -1574,6 +1559,7 @@ def prefetch(upto = 1028)
   Crest.mget_ary(mget_q)
 
   puts "prefetch #{Time.now - prefetch_start}s"
+  puts ">>> prefetch.end <<<"
 end
 
 
@@ -1876,11 +1862,7 @@ Cache.restore
 while 1
   $timers[:main] = Time.now
 
-  prefetch 1
-  Cache.save
-  Station.import_deferred
-  
-  prefetch 2
+  prefetch
   Cache.save
 
   candidates = Evecentral.get_profitables # returns 3-tuple [from_stn, to_stn, item] 
