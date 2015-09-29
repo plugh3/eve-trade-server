@@ -57,13 +57,10 @@ end
 
 
 ### Cache class -- (key x value x expiration time)
-### methods
+### defined
 ###   get(key)
-###   set(key, val, time)
+###   set(key, val, time) -- vals are Typhoeus::Response.body
 ###   ttl() -- defines cache policy based on key (URL) type
-### usage
-###   cache[k] = [v, expire]
-###   v = Response.body
 class Cache
   CACHE_FILE = "#{__dir__}/cache.txt"
   @@cache = Hash.new([nil, nil])
@@ -219,6 +216,7 @@ class Cache
   end
 
 end
+Cache.restore
 
 
 ### CachedResponse - mimic Typhoeus::Response objects for cache hits
@@ -451,15 +449,6 @@ class EveDataCollection
       puts "ref_accessor(#{self.to_s}) :#{id_name}, :#{obj_name}()"
     end
   end
-
-  @@_deferred_imports = []
-  def self.register_deferred_import(m) 
-    @@_deferred_imports << m 
-  end
-  def self.import_deferred
-    @@_deferred_imports.each { |m| m.call }
-  end
-  #<class>.method(:<method_name>)
 end
 
 
@@ -624,11 +613,10 @@ class Station < EveDataCollection
 
   ### two import sources: (i) Static Data Dump (SQL) and (ii) Conquerable Station List (XML)
   include ImportSql
-  @sdd_table     = "stastations"
-  @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
+    @sdd_table     = "stastations"
+    @sdd_fieldmap  = {"stationID"=>:id, "stationName"=>:name, "regionID"=>:region_id, "solarSystemID"=>:system_id}
   import_sdd(@sdd_table, @sdd_fieldmap)
   def self.import_csl
-    puts ">>> import_csl()"
     url = "https://api.eveonline.com/eve/ConquerableStationList.xml.aspx"
     raw = (HTTPSource.get(url)).body
     xml = REXML::Document.new(raw)
@@ -641,10 +629,7 @@ class Station < EveDataCollection
       s = Station.new({id:stn_id, name:stn_name, system_id:system_id, region_id:region_id})
     end
   end
-  def self.import_deferred
-    puts ">>> import_deferred()"
-    import_csl
-  end
+  import_csl
   
   def Station.hub?(stn_id)
     lookup = {
@@ -764,9 +749,9 @@ end
 
 
 
-### TODO: store $markets data in Region[r].buy_orders[item]
+### TODO: store Market[] data in Region[r].buy_orders[item]
 
-### $markets[region][item] => Market
+### Market[region][item] => Market
 ###   buy_orders = Orders[]
 ###   sell_orders = Orders[]
 ###   buy_sampled = Time
@@ -776,6 +761,9 @@ class Market
   attr_accessor :region_id, :item_id, :buy_orders, :sell_orders, :buy_sampled, :sell_sampled
   def region() Region[@region_id] end
   def item()   Item[@item_id]     end
+
+  ### autovivify Market[region_id][item_id]
+  @data = Hash.new {|h1,rid| h1[rid] = Hash.new {|h2,iid| h2[iid] = Market.new(rid, iid)} } 
   
   def initialize(region_id, item_id)
     @region_id = region_id
@@ -786,9 +774,24 @@ class Market
     @sell_sampled = Time.new(0)
   end  
 
+  def self.[](region_id)
+    @data[region_id]
+  end
+  
+  ### each_reg() -- blk(reg_id, Market[reg_id][])
+  def self.each_reg
+    @data.each { |reg_id, mkt_by_item| yield(reg_id, mkt_by_item) }
+  end  
+  ### each_reg() -- blk(reg_id, item_id, Market)
+  def self.each
+    @data.each_key do |reg_id| 
+      @data[reg_id].each_key do |item_id|
+        yield(reg_id, item_id, @data[reg_id][item_id]) 
+      end
+    end
+  end  
+ 
 end
-## autovivify $markets[r] and $markets[r][i]
-$markets = Hash.new {|h1,rid| h1[rid] = Hash.new {|h2,iid| h2[iid] = Market.new(rid, iid)} } 
 
 
 
@@ -1201,9 +1204,8 @@ class Crest < HTTPSource
   def self._get_market_orders(region_id, item_id, now, buy)
     _load_static_data unless @@_static_loaded
     r = Region[region_id]
-    assert(r, "bad index Region[#{region_id}]")
     i = Item[item_id]
-    m = $markets[region_id][item_id]
+    m = Market[region_id][item_id]
     sampled = buy ? m.buy_sampled : m.sell_sampled
     if now > sampled 
       href = (buy ? r.buy_href : r.sell_href) + "?type=" + i.href
@@ -1227,7 +1229,7 @@ class Crest < HTTPSource
     _get_market_orders(from, item, now, false)
   end
 
-  ### import_orders() - fetch market orders; populate $markets[][].buy_orders, .sell_orders
+  ### import_orders() - fetch market orders; populate Market[][].buy_orders, .sell_orders
   def self.import_orders(trades)
     #puts "Crest.import_orders()"
     hrefs = []
@@ -1274,6 +1276,7 @@ class Marketlogs < HTTPSource
     item_name = @@fname2name[m[:item]] || m[:item]  ### some item filenames are modified
     item_id = Item[item_name].id
     sample_time = Time.utc(m[:yr], m[:mo], m[:dy], m[:hh], m[:mm], m[:ss]) + EXPORT_TRUMP_TIME
+    
     [region_id, item_id, sample_time]
   end
 
@@ -1344,7 +1347,7 @@ class Marketlogs < HTTPSource
       fname = EXPORT_DIR + fname_short
       region_id, item_id, f_sampled = Marketlogs.file_attrs(fname)
       
-      mkt = $markets[region_id][item_id]
+      mkt = Market[region_id][item_id]
       buy_sampled = mkt.buy_sampled
       sell_sampled = mkt.sell_sampled
       if (f_sampled > buy_sampled or f_sampled > sell_sampled) then
@@ -1630,8 +1633,8 @@ class Trade < EveDataCollection
       "Raysere's Modified Mega Beam Laser" => true,
     }
 
-    asks = $markets[from.region_id][item_id].sell_orders
-    bids = $markets[to.region_id][item_id].buy_orders
+    asks = Market[from.region_id][item_id].sell_orders
+    bids = Market[  to.region_id][item_id].buy_orders
     if item.name.match("^(Improved|Standard|Strong) .* Booster$")
       ### contraband
       true
@@ -1652,18 +1655,15 @@ end   ### Trade class
 
 
 ### find profitable trades
-### in: $markets, candidates
+### in: candidates, [Market[]]
 ### out: trades
 def calc_trades(candidates)
   _start = Time.now
   ### sort orders by price
-  $markets.each_key do |reg|
-    $markets[reg].each_key do |i|
-      mkt = $markets[reg][i]
-      next if mkt.buy_orders.length == 0 and mkt.sell_orders.length == 0
-      mkt.sell_orders.sort! {|o1, o2| o1.price <=> o2.price }
-      mkt.buy_orders.sort!  {|o1, o2| o2.price <=> o1.price }
-    end
+  Market.each do |_rid, _iid, mkt|
+    next if mkt.buy_orders.length == 0 and mkt.sell_orders.length == 0
+    mkt.sell_orders.sort! {|o1, o2| o1.price <=> o2.price }
+    mkt.buy_orders.sort!  {|o1, o2| o2.price <=> o1.price }
   end
   
   trades = {} ### trades{route_id}{item}  => item
@@ -1676,8 +1676,8 @@ def calc_trades(candidates)
     trades[rt][Trade::K_SUM] ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:Trade::K_SUM})
     trades[rt][iid]          ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:iid})
     ### market orders are by region, so filter by station
-    mkt_from = $markets[Station[from_sid].region_id][iid]
-    mkt_to   = $markets[Station[  to_sid].region_id][iid]
+    mkt_from = Market[Station[from_sid].region_id][iid]
+    mkt_to   = Market[Station[  to_sid].region_id][iid]
     trades[rt][iid].asks = mkt_from.sell_orders.select {|o| o.station_id==from_sid}
     trades[rt][iid].bids =   mkt_to.buy_orders.select  {|o| o.station_id==to_sid}
     trades[rt][iid].age = [mkt_from.sell_sampled, mkt_to.buy_sampled].max  ### most recent
@@ -1696,7 +1696,7 @@ def calc_trades(candidates)
     trades[rt].each do |iid, t|
       next if iid == Trade::K_SUM
       asks = t.asks
-      bids = t.bids   
+      bids = t.bids
 
       i_ask = 0
       i_bid = 0
@@ -1857,7 +1857,6 @@ class WheatDB
 end
 
 
-Cache.restore
 ### main loop
 while 1
   $timers[:main] = Time.now
@@ -1866,8 +1865,8 @@ while 1
   Cache.save
 
   candidates = Evecentral.get_profitables # returns 3-tuple [from_stn, to_stn, item] 
-  Crest.import_orders(candidates)         # populates $markets
-  Marketlogs.import_orders                # populates $markets
+  Crest.import_orders(candidates)         # populates Market[]
+  Marketlogs.import_orders                # populates Market[]
   trades = calc_trades(candidates)        # confirm trades against fresh market data
 
   ### export to DB: orders, trades, orders_trades
