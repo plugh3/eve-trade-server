@@ -1666,12 +1666,12 @@ def calc_trades(candidates)
     mkt.buy_orders.sort!  {|o1, o2| o2.price <=> o1.price }
   end
   
-  trades = {} ### trades{route_id}{item}  => item
-              ### trades{route_id}{Trade::K_SUM} => route totals
+  trades = {} ### trades{[from_sid, to_sid]}{item}  => item
+              ### trades{[from_sid, to_sid]}{Trade::K_SUM} => route totals
   Trade.wipe  ### reset datastore
   candidates.each do |tuple|
     from_sid, to_sid, iid = tuple
-    rt = [from_sid, to_sid]
+    rt = [Station[from_sid], Station[to_sid]]
     trades[rt]               ||= {}
     trades[rt][Trade::K_SUM] ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:Trade::K_SUM})
     trades[rt][iid]          ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:iid})
@@ -1768,9 +1768,7 @@ def calc_trades(candidates)
   routes_inc.each do |rt|
     n+=1
     last_rt = rt
-    from_sid, to_sid = rt
-    from_stn = Station[from_sid]
-    to_stn = Station[to_sid]
+    from_stn, to_stn = rt
     totals = trades[rt][Trade::K_SUM]
     next if totals.profit == 0 
     next if totals.profit < min_route_profit
@@ -1783,7 +1781,7 @@ def calc_trades(candidates)
     sorted = trades[rt].values.sort do |a,b| b.profit <=> a.profit end 
     sorted.each do |t| 
       next if t.item_id == Trade::K_SUM 
-      puts "    $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{Item[t.item_id].name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
+      puts "    $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{t.item.name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
       if t.profit > 100_000_000
         t.asks.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
         puts "    ---"
@@ -1794,21 +1792,19 @@ def calc_trades(candidates)
   puts "calc_trades() #{'%.3f'%(Time.now - _start)}s"
   
   ### paste last route to clipboard
-  ### TODO: change the "fromID:toID" join string to object references!!! this is stupid
-  from_sid, to_sid = last_rt
-  from_stn = Station[from_sid]
-  to_stn = Station[to_sid]
-  ### TODO: change these to object references
+  from_stn, to_stn = last_rt
   buf = "\n#{from_stn.sname} => #{to_stn.sname}\n\n"
   sorted = trades[last_rt].values.sort do |a,b| b.profit <=> a.profit end 
   sorted.each do |t| 
     next if t.item_id == Trade::K_SUM 
-    buf << "#{Item[t.item_id].name}\n"
+    buf << "#{t.item.name}\n"
   end
   buf << "\n"
-  #puts "Copy to clipboard:\n#{buf}"
   Clipboard.copy(buf)
   puts "\a"   # beep
+  puts "------\n"
+  puts "Copy to clipboard:\n#{buf}"
+  puts "------\n"
 
   trades
 end
