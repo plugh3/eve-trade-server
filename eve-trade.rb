@@ -344,9 +344,9 @@ end
 class Mymysql < Mysql2::Client
   ### mysql option defaults
   @@mysql_opts = {}
-  #@@mysql_opts[:host]     = "127.0.0.1"
+  @@mysql_opts[:host]     = "127.0.0.1"
   #@@mysql_opts[:host]     = "plugh.asuscomm.com"
-  @@mysql_opts[:host]     = "69.181.214.54"
+  #@@mysql_opts[:host]     = "69.181.214.54"
   @@mysql_opts[:port]     = 3306
   @@mysql_opts[:username] = "dev"
   @@mysql_opts[:password] = "BNxJYjXbYXQHAvFM"
@@ -375,6 +375,7 @@ class SqlQueue
     @db = db
     @sql_base = sql_base
     @sql = @sql_base.dup
+    @done = {}
     ### query max packet size
     r = @db.query("SHOW variables LIKE 'max_allowed_packet';")
     r.each {|row| if row["Variable_name"]=='max_allowed_packet' then @sql_max = row["Value"].to_i - SQL_MAX_ADJUST; break end}
@@ -387,7 +388,8 @@ class SqlQueue
   
   def <<(vals)
     if (@sql.size + SQL_HDR.size + vals.size + SQL_EOF.size) > @sql_max then flush end
-    @sql << SQL_HDR + vals + SQL_EOL
+    @sql << SQL_HDR + vals + SQL_EOL unless @done[vals]
+    @done[vals] = true
   end
   
   def flush
@@ -444,9 +446,9 @@ class EveDataCollection
       id_name = id_sym.to_s
       obj_name = id_name.chomp("_id")
       obj_klass = Object.const_get(obj_name.capitalize)
-      #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end")   ### also works
-      define_method(obj_name) do obj_klass[instance_variable_get("@#{id_name}")] end    ### safer?
-      puts "ref_accessor(#{self.to_s}) :#{id_name}, :#{obj_name}()"
+      define_method(obj_name) do obj_klass[instance_variable_get("@#{id_name}")] end ### safer than below?
+      #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end")              ### this also works
+      #puts "ref_accessor(#{self.to_s}) :#{id_name}, :#{obj_name}()"
     end
   end
 end
@@ -762,8 +764,8 @@ class Market
   def region() Region[@region_id] end
   def item()   Item[@item_id]     end
 
-  ### autovivify Market[region_id][item_id]
-  @data = Hash.new {|h1,rid| h1[rid] = Hash.new {|h2,iid| h2[iid] = Market.new(rid, iid)} } 
+  ### autovivify Market[region][item]
+  @data = Hash.new {|h1,r| h1[r] = Hash.new {|h2,i| h2[i] = Market.new(r.id, i.id)} } 
   
   def initialize(region_id, item_id)
     @region_id = region_id
@@ -774,19 +776,19 @@ class Market
     @sell_sampled = Time.new(0)
   end  
 
-  def self.[](region_id)
-    @data[region_id]
+  def self.[](region)
+    @data[region]
   end
   
-  ### each_reg() -- blk(reg_id, Market[reg_id][])
+  ### each_reg() -- blk(reg, Market[reg][])
   def self.each_reg
-    @data.each { |reg_id, mkt_by_item| yield(reg_id, mkt_by_item) }
+    @data.each { |r, mkt_by_item| yield(r, mkt_by_item) }
   end  
-  ### each_reg() -- blk(reg_id, item_id, Market)
+  ### each_reg() -- blk(reg, item, Market)
   def self.each
-    @data.each_key do |reg_id| 
-      @data[reg_id].each_key do |item_id|
-        yield(reg_id, item_id, @data[reg_id][item_id]) 
+    @data.each_key do |r| 
+      @data[r].each_key do |i|
+        yield(r, i, @data[r][i]) 
       end
     end
   end  
@@ -850,19 +852,19 @@ class Evecentral < HTTPSource
   REGEXP_PROFITABLE = \
 '
 \<tr\>
-  \<td\>\<b\>From:\<\/b\> (?<askLocation>[^<]+)\<\/td\>
-  \<td\>\<b\>To:\<\/b\> (?<bidLocation>[^<]+) \<\/td\>
+  \<td\>\<b\>From:\<\/b\> (?<from_stn_name>[^<]+)\<\/td\>
+  \<td\>\<b\>To:\<\/b\> (?<to_stn_name>[^<]+) \<\/td\>
   \<td\>\<b\>Jumps:\<\/b\> [0-9]+\<\/td\>
 \<\/tr\>
 \<tr\>
-  \<td\>\<b\>Type:\<\/b\> \<a href=\"(?<itemURLsuffix>quicklook.html\?typeid=(?<itemID>[0-9]+))\"\>(?<itemName>[^<]+)\<\/a\>\<\/td\>
-  \<td\>\<b\>Selling:\<\/b\> (?<askPrice>[,.0-9]+) ISK\<\/td\>
-  \<td\>\<b\>Buying:\<\/b\> (?<bidPrice>[,.0-9]+) ISK\<\/td\>
+  \<td\>\<b\>Type:\<\/b\> \<a href=\"(?<item_url_suffix>quicklook.html\?typeid=(?<item_id>[0-9]+))\"\>(?<item_name>[^<]+)\<\/a\>\<\/td\>
+  \<td\>\<b\>Selling:\<\/b\> (?<ask_price>[,.0-9]+) ISK\<\/td\>
+  \<td\>\<b\>Buying:\<\/b\> (?<bid_price>[,.0-9]+) ISK\<\/td\>
 \<\/tr\>
 
 \<tr\>
   \<td\>\<b\>Per-unit profit:\<\/b\> [,.0-9]+ ISK\<\/td\>
-  \<td\>\<b\>Units tradeable:\<\/b\> [,0-9]+ \((?<askVolume>[,0-9]+) -\&gt; (?<bidVolume>[,0-9]+)\)\<\/td\>
+  \<td\>\<b\>Units tradeable:\<\/b\> [,0-9]+ \((?<ask_vol>[,0-9]+) -\&gt; (?<bid_vol>[,0-9]+)\)\<\/td\>
   \<td\>\&nbsp;\<\/td\>
 \<\/tr\>
 \<tr\>
@@ -873,6 +875,10 @@ class Evecentral < HTTPSource
 \<tr\>\<td\>\&nbsp;\<\/td\>\<\/tr\>
 
 ' ### end REGEXP_PROFITABLE
+### match variables
+###   from_stn_name, ask_price, ask_vol
+###   to_stn_name, bid_price, bid_vol
+###   item_id, item_name, item_url_suffix
 
   def self.import_html(html)
     
@@ -888,21 +894,20 @@ class Evecentral < HTTPSource
     n = $counters[:profitables]
     while (m = re_block.match(m.post_match)) do
       $counters[:profitables] += 1
-      assert(Station[m[:askLocation]], "Evecentral.import_html(): station not found #{m[:askLocation]}")
-      assert(Station[m[:bidLocation]], "Evecentral.import_html(): station not found #{m[:bidLocation]}")
-      from_sid = Station[m[:askLocation]].id
-      to_sid = Station[m[:bidLocation]].id
-      item_id = m[:itemID].to_i
+      assert(Station[m[:from_stn_name]], "Evecentral.import_html(): station not found #{m[:from_stn_name]}")
+      assert(Station[m[:to_stn_name]],   "Evecentral.import_html(): station not found #{m[:to_stn_name]}")
+      from_stn = Station[m[:from_stn_name]]
+      to_stn   = Station[m[:to_stn_name]]
+      item  = Item[m[:item_id].to_i]
       #next if !from.hub? || !to.hub?  ### hub stations only
-      trade = [from_sid, to_sid, item_id]
-      trade_id = trade.join(":")
-      trades[trade_id] = trade  ### filter out dups
+      trade = [from_stn, to_stn, item]
+      trades[trade] = true  ### filter out dups
     end 
     $timers[:parse] += Time.new - start_parse
     #puts ("%5i" % ($counters[:profitables] - n)) + " routes parsed"
     #puts "  parsing " + ("%0.2f" % (html.size / 1_000_000.0)) + "MB"
 
-    trades.values
+    trades.keys
   end
 
   def self.url_gen(from, to, qtype)
@@ -984,7 +989,7 @@ class Crest < HTTPSource
   URI_PATH_REGIONS    = 'regions'       ### "/regions/"
   URL_AUTH = "https://login-tq.eveonline.com/oauth/token/"
   RE_MARKET = "https://crest-tq\\.eveonline\\.com/market/[0-9]{8}/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/[0-9]+/"
-
+ 
   @@client_id = 'e5a122800a134da2ad4b0e01664b627b'  ### app's ID (secret key is passed by command line)
   @@client_rtoken = '2-X4wdpBzGMTkpy8bdk0jg-gi6YfwVWyp_G9PbJtAME1'  ### app's refresh token
 
@@ -994,31 +999,30 @@ class Crest < HTTPSource
   @@crest_http_opts[:ssl_cipher_list]  = "TLSv1"
   @@crest_http_opts[:cainfo]           = "#{__dir__}/cacert.pem"
   
-  ### TODO: cache
   @@root_hrefs = nil
   @@_static_loaded = false
   
-  def self.re_market
+  def Crest.re_market
     RE_MARKET
   end
-  def self.re_auth
+  def Crest.re_auth
     URL_AUTH
   end
-  def self.re_root
+  def Crest.re_root
     URI_ROOT
   end
   
-  def self._client_secret
+  def Crest._client_secret
     ARGV.each { |arg| if arg.match("--client-secret=(.*)") then return $1 end }
     raise "client secret key not provided"
   end
   
-  def self._client_id_encoded
+  def Crest._client_id_encoded
     Base64.strict_encode64(@@client_id + ":" + _client_secret)
   end
   
   ### get access token
-  def self.refresh_atoken_opts
+  def Crest.refresh_atoken_opts
     opts = @@crest_http_opts.dup
 
     headers = {}
@@ -1034,7 +1038,7 @@ class Crest < HTTPSource
     
     opts
   end
-  def self.set_atoken(response)
+  def Crest.set_atoken(response)
     json = JSON.parse(response.body)
     @@access_token = json["access_token"]
 
@@ -1042,23 +1046,23 @@ class Crest < HTTPSource
     @@access_expire = now + json["expires_in"]
     #puts "access_token exp #{@@access_expire - Time.now}s = #{@@access_token}"
   end
-  def self._refresh_atoken
+  def Crest._refresh_atoken
     opts = refresh_atoken_opts
     r = get(URL_AUTH, opts)
     set_atoken(r)
   end  
-  def self.get_atoken
+  def Crest.get_atoken
     if (!defined?(@@access_token)) || (Time.now > @@access_expire) then _refresh_atoken end
     @@access_token
   end
 
-  def self.http_opts
+  def Crest.http_opts
     @@crest_http_opts
   end
   
   ### get_href() - returns href response as array of Responses
   ###   handles multi-page responses invisibly
-  def self.get_href(href)
+  def Crest.get_href(href)
     ### HTTP options
     opt = @@crest_http_opts.dup
     headers = {}
@@ -1099,7 +1103,7 @@ class Crest < HTTPSource
 
   
   ### get_href_as_items() - returns href response as array of json "items"
-  def self.get_href_as_items(href)
+  def Crest.get_href_as_items(href)
     responses = get_href(href)
     items = Array.new
     responses.each do |r| 
@@ -1115,7 +1119,7 @@ class Crest < HTTPSource
   ###   hrefs - array of hrefs to fetch
   ###   blocks - array of blocks indexed by href
   ### returns: array of Responses
-  def self.get_hrefs_each(hrefs, blocks)
+  def Crest.get_hrefs_each(hrefs, blocks)
     #puts "get_hrefs_each(#{hrefs.length}) -- #{pretty hrefs[0]}"
     #hrefs.each do |h| print "  #{pretty(h)}" end ; puts ""
     
@@ -1133,22 +1137,22 @@ class Crest < HTTPSource
 
   
 
-  def self._get_root
+  def Crest._get_root
     r = get_href(URI_ROOT)[0]
     JSON.parse(r.body)    
   end
-  def self._href_item_types
+  def Crest._href_item_types
     @@root_hrefs ||= _get_root
     @@root_hrefs[URI_PATH_ITEMTYPES]["href"]
   end
-  def self._href_regions
+  def Crest._href_regions
     @@root_hrefs ||= _get_root
     @@root_hrefs[URI_PATH_REGIONS]["href"]
   end
 
 
   RE_CREST_MARKET2 = "https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/"
-  def self.pretty(href)
+  def Crest.pretty(href)
     x = href
     if x.match(RE_CREST_MARKET2) then x = "#{$1}.#{$3}.#{$2}" end
     if x.match "eve-central.com" then x = Evecentral.pretty x end
@@ -1159,14 +1163,14 @@ class Crest < HTTPSource
   
  
   ### load_regions() - populate Region[].href from Crest
-  def self._load_region_hrefs
+  def Crest._load_region_hrefs
     items = get_href_as_items(_href_regions)
     items.each { |i| Region[i["name"]].href = i["href"] }
   end
   ### load_markets() - fetch values for Region[].buy_href and .sell_href 
   ### prereq - assumes Region[].href is already defined
   ### NOTE: ~100 GETs 
-  def self._load_market_hrefs
+  def Crest._load_market_hrefs
     hrefs = []
     blocks = {}
     Region.each do |k, region|
@@ -1182,7 +1186,7 @@ class Crest < HTTPSource
   end
   ### load_items() - populate Item[].href
   ### NOTE: Crest might have "new" items not seen in import
-  def self._load_itemtype_hrefs
+  def Crest._load_itemtype_hrefs
     items = get_href_as_items(_href_item_types)
     items.each do |i|
       id = i["type"]["id"]
@@ -1192,7 +1196,7 @@ class Crest < HTTPSource
     end
   end
   ### _load_static_data() - fetch hrefs for Region and Item (prereq to fetching market orders)
-  def self._load_static_data
+  def Crest._load_static_data
     _load_region_hrefs    # Region[].href
     _load_market_hrefs    # Region[].buy_href, .sell_href
     _load_itemtype_hrefs  # Item[].href
@@ -1201,18 +1205,16 @@ class Crest < HTTPSource
   
   ### get_market_orders() - returns href and callback for market order fetch
   ### branched for two flavors (buy and sell)
-  def self._get_market_orders(region_id, item_id, now, buy)
+  def Crest._get_market_orders(r, i, now, buy)
     _load_static_data unless @@_static_loaded
-    r = Region[region_id]
-    i = Item[item_id]
-    m = Market[region_id][item_id]
+    m = Market[r][i]
     sampled = buy ? m.buy_sampled : m.sell_sampled
     if now > sampled 
       href = (buy ? r.buy_href : r.sell_href) + "?type=" + i.href
       proc = Proc.new do |response|
         items = (JSON.parse(response.body))["items"]
         $counters[:size] += response.body.size
-        orders = items.map { |i| Order.import_crest_item(i, sampled) }
+        orders = items.map { |x| Order.import_crest_item(x, sampled) }
         m.instance_variable_set(buy ? '@buy_orders' : '@sell_orders', orders)
         m.instance_variable_set(buy ? '@buy_sampled' : '@sell_sampled', now)
         #puts ">>> crest #{buy ? 'buy ' : 'sell'} #{'%-11s' % r.name}::#{i.name}  #{now}"
@@ -1222,23 +1224,23 @@ class Crest < HTTPSource
       [nil, nil]
     end
   end
-  def self._get_market_buy_orders(to, item, now)
-    _get_market_orders(to, item, now, true)
-  end
   def self._get_market_sell_orders(from, item, now)
     _get_market_orders(from, item, now, false)
   end
+  def self._get_market_buy_orders(to, item, now)
+    _get_market_orders(to, item, now, true)
+  end
 
   ### import_orders() - fetch market orders; populate Market[][].buy_orders, .sell_orders
-  def self.import_orders(trades)
+  def Crest.import_orders(candidates)
     #puts "Crest.import_orders()"
     hrefs = []
     procs = {}
     now = Time.now.getutc
-    trades.each do |t|
-      from_sid, to_sid, item = t
-      from_r = Station[from_sid].region_id
-      to_r =   Station[  to_sid].region_id
+    candidates.each do |t|
+      from_stn, to_stn, item = t
+      from_r = from_stn.region
+      to_r   =   to_stn.region
       
       ### get sell orders
       href, proc = _get_market_sell_orders(from_r, item, now)
@@ -1269,7 +1271,7 @@ class Marketlogs < HTTPSource
 
   EXPORT_FNAME_REGEXP = /^C:\\Users\\csserra\\Documents\\EVE\\logs\\Marketlogs\\(?<region>[^-]+)-(?<item>.*?)-(?<yr>[0-9]{4})\.(?<mo>[0-9][0-9])\.(?<dy>[0-9][0-9]) (?<hh>[0-9][0-9])(?<mm>[0-9][0-9])(?<ss>[0-9][0-9])\.txt$/
   EXPORT_TRUMP_TIME = 5*60  ### live export data trumps CREST data for 5 mins 
-  def self.file_attrs(fname)
+  def Marketlogs.file_attrs(fname)
     m = fname.match(EXPORT_FNAME_REGEXP)
     assert(m, "marketlog filename #{fname}")
     region_id = Region[m[:region]].id
@@ -1280,7 +1282,7 @@ class Marketlogs < HTTPSource
     [region_id, item_id, sample_time]
   end
 
-  def self.import_file(fname)
+  def Marketlogs.import_file(fname)
     region_id, item_id, sample_time = file_attrs(fname)
     file = File.new(fname, "r")
     file.gets   ### header line
@@ -1301,7 +1303,7 @@ class Marketlogs < HTTPSource
   EXPORT_TTL = 3*24*60*60 # delete after 3 days
   
   ### purge_old() - delete older versions of marketlog files
-  def self.purge_old
+  def Marketlogs.purge_old
     dir = Dir.new(EXPORT_DIR)
     latest_fnames = {}
     latest_times = {}
@@ -1309,7 +1311,7 @@ class Marketlogs < HTTPSource
       next if fname_short == "." or fname_short == ".."
       me_fname = EXPORT_DIR + fname_short
       region_id, item_id, me_sampled = Marketlogs.file_attrs(me_fname)
-      mkt_id = [region_id, item_id].join(":")
+      mkt_id = [region_id, item_id]
 
       if Time.now - me_sampled > EXPORT_TTL     # past expiration so delete me
           puts "!!! deleting marketlog expired #{me_fname}"
@@ -1333,11 +1335,12 @@ class Marketlogs < HTTPSource
   end
   
   ### import_orders() - check all marketlog files, import if more recent
-  def self.import_orders
+  ### populates Market[][]
+  ### call this every 2 sec
+  def Marketlogs.import_orders
     if not Dir.exists?(EXPORT_DIR) then puts "Marketlogs: directory not found #{EXPORT_DIR}"; return false; end
     _start = Time.now
     #puts "Marketlogs.import_orders()"
-    ### call this every 2 sec
     purge_old
     update = false
     dir = Dir.new(EXPORT_DIR)
@@ -1347,7 +1350,7 @@ class Marketlogs < HTTPSource
       fname = EXPORT_DIR + fname_short
       region_id, item_id, f_sampled = Marketlogs.file_attrs(fname)
       
-      mkt = Market[region_id][item_id]
+      mkt = Market[Region[region_id]][Item[item_id]]
       buy_sampled = mkt.buy_sampled
       sell_sampled = mkt.sell_sampled
       if (f_sampled > buy_sampled or f_sampled > sell_sampled) then
@@ -1567,36 +1570,49 @@ end
 
 
 class Trade < EveDataCollection
-  ref_accessor  :item_id
   attr_accessor :id, :from_sid, :to_sid, :bids, :asks, \
                 :qty, :profit, :cost, :age, :size, :ppv, :roi
+  ref_accessor  :item_id
   def from() Station[@from_sid] end
   def to()   Station[@to_sid]   end
   
-  @@uid = 1 
-  
-  @data = {}        ### Trade[] datastore
-  K_SUM = 'totals'  ### special item_id for route totals
-  def self.each
-    @data.values.uniq.each { |v| yield(v.id, v) unless v.item_id == K_SUM }  ### ignore K_SUM entries
+  @data = {}           ### Trade[] datastore
+  K_SUM = '>>totals<<' ### reserved "item" name for route aggregators (trades[rt][K_SUM] = sum of trades[rt][*])
+  def special?
+    @item_id == K_SUM
+  end
+  def Trade.each
+    @data.values.uniq.each { |x| yield(x.id, x) unless x.special? }  ### ignore K_SUM entries
   end  
-  def self.wipe
+  def Trade.wipe
     @data = {}
   end
+
+  def Trade.data
+    @data
+  end
   
-  def initialize(fields={})
-    ### primary
+  @@uid = 1 
+  def initialize(ivars={})
+    ### instantiate by hash
+    @id = @@uid; @@uid+=1  ### not a native Eve type, so need to generate our own UID
+    super(ivars)
+    ### financials
     @qty = 0
     @profit = 0.0
     @cost = 0.0
-    @age = Time.new(0)
-    ### secondary (derived)
     @size = 0.0
     @ppv = 0.0
     @roi = 0.0
-    ### db
-    @id = @@uid; @@uid+=1
-    super(fields)
+    @age = Time.new(0)
+    ### market orders are by region, so filter by station
+    if not special?
+      mkt_from = Market[from.region][item]
+      mkt_to   = Market[  to.region][item]
+      @asks = mkt_from.sell_orders.select {|o| o.station==from}
+      @bids =   mkt_to.buy_orders.select  {|o| o.station==to}
+      @age = [mkt_from.sell_sampled, mkt_to.buy_sampled].max  ### most recent
+    end
   end
 
   def +(other)
@@ -1616,9 +1632,10 @@ class Trade < EveDataCollection
   end
   def export_sql
     ### TODO: esc = method...
-    from_stn_e = Mysql2::Client.escape(from.sname)
-    to_stn_e   = Mysql2::Client.escape(to.sname)
-    itemname_e = Mysql2::Client.escape(item.name)
+    esc = Mysql2::Client.method(:escape)
+    from_stn_e = esc.call(from.sname)
+    to_stn_e   = esc.call(to.sname)
+    itemname_e = esc.call(item.name)
     "(#{id}, '#{from_stn_e}', '#{to_stn_e}', '#{itemname_e}', #{qty}, #{profit}, #{cost}, #{size}, #{ppv}, #{roi})"
   end
 
@@ -1633,8 +1650,8 @@ class Trade < EveDataCollection
       "Raysere's Modified Mega Beam Laser" => true,
     }
 
-    asks = Market[from.region_id][item_id].sell_orders
-    bids = Market[  to.region_id][item_id].buy_orders
+    asks = Market[from.region][item].sell_orders
+    bids = Market[  to.region][item].buy_orders
     if item.name.match("^(Improved|Standard|Strong) .* Booster$")
       ### contraband
       true
@@ -1653,48 +1670,42 @@ class Trade < EveDataCollection
 
 end   ### Trade class
 
-
-### find profitable trades
-### in: candidates, [Market[]]
+### calc_trades() -- calculate trades by matching buy/sell orders; also filters for profit, scams, etc.
+### in: candidates, Market[][]
 ### out: trades
 def calc_trades(candidates)
   _start = Time.now
-  ### sort orders by price
+
+  ### sort all orders by price
   Market.each do |_rid, _iid, mkt|
     next if mkt.buy_orders.length == 0 and mkt.sell_orders.length == 0
     mkt.sell_orders.sort! {|o1, o2| o1.price <=> o2.price }
     mkt.buy_orders.sort!  {|o1, o2| o2.price <=> o1.price }
   end
-  
-  trades = {} ### trades{[from_sid, to_sid]}{item}  => item
-              ### trades{[from_sid, to_sid]}{Trade::K_SUM} => route totals
-  Trade.wipe  ### reset datastore
-  candidates.each do |tuple|
-    from_sid, to_sid, iid = tuple
-    rt = [Station[from_sid], Station[to_sid]]
-    trades[rt]               ||= {}
-    trades[rt][Trade::K_SUM] ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:Trade::K_SUM})
-    trades[rt][iid]          ||= Trade.new({from_sid:from_sid, to_sid:to_sid, item_id:iid})
-    ### market orders are by region, so filter by station
-    mkt_from = Market[Station[from_sid].region_id][iid]
-    mkt_to   = Market[Station[  to_sid].region_id][iid]
-    trades[rt][iid].asks = mkt_from.sell_orders.select {|o| o.station_id==from_sid}
-    trades[rt][iid].bids =   mkt_to.buy_orders.select  {|o| o.station_id==to_sid}
-    trades[rt][iid].age = [mkt_from.sell_sampled, mkt_to.buy_sampled].max  ### most recent
-  end
 
+  ### populate trades[[from_stn, to_stn]][item] from candidates[]
+  Trade.wipe  ### reset datastore
+  trades = {} ### reset
+  candidates.each do |(from, to, item)|
+    rt = [from, to]
+    trades[rt]               ||= {}
+    trades[rt][Trade::K_SUM] ||= Trade.new({from_sid:from.id, to_sid:to.id, item_id:Trade::K_SUM})
+    trades[rt][item]           = Trade.new({from_sid:from.id, to_sid:to.id, item_id:item.id})
+  end
+  
+  ### match bid/ask orders for each trades[route][item]
+  puts "------------\n"
+  ### financial parameters
   net_tax = 0.9925  ### Accounting skill level 5
   min_profit = 1
   min_ppv = 1_000
   min_total_profit = 3_000_000
   min_route_profit = 20_000_000
-
-  ### match bids/asks
-  ### iterate through all trades[route][item]
-  puts "------------\n"
   trades.each_key do |rt| 
-    trades[rt].each do |iid, t|
-      next if iid == Trade::K_SUM
+    trades[rt].each_key do |item|
+      next if item==Trade::K_SUM  ### aggregators
+
+      t = trades[rt][item]
       asks = t.asks
       bids = t.bids
 
@@ -1722,18 +1733,18 @@ def calc_trades(candidates)
         t.cost += qty * ask.price
       end  ### match bids/asks
 
-      ### skip if no profitable matches
-      if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(iid); next end
+      ### delete if no profitable matches (item)
+      if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(item); next end
 
       ### derived calcs
-      t.size = t.qty * Item[iid].volume
+      t.size = t.qty * item.volume
       t.ppv = t.profit / t.size
       t.roi = t.profit / t.cost
 
-      ### skip item? check profit thresholds, known scams, etc.
-      if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(iid); next end
-      if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(iid); next end
-      if t.suspicious?                then Trade.delete(t.id); trades[rt].delete(iid); next end
+      ### delete if under profit thresholds, known scam, etc. (item)
+      if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(item); next end
+      if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(item); next end
+      if t.suspicious?                then Trade.delete(t.id); trades[rt].delete(item); next end
       ### TODO: Trade.ignore
       
       ### flag unprofitable orders
@@ -1751,47 +1762,51 @@ def calc_trades(candidates)
       trades[rt][Trade::K_SUM] += t
     end  ### each trade[rt][*iid*]
     
-    ### check profit threshold for route in aggregate
+    ### delete if under profit threshold (route)
     if trades[rt][Trade::K_SUM].profit < min_route_profit then
       ### wipe entire route
-      ### TODO: ignore instead?
-      trades[rt].each do |iid, t| Trade.delete(t.id); trades[rt].delete(iid) end
+      trades[rt].each do |item, t| Trade.delete(t.id); trades[rt].delete(item) end
       trades[rt].delete(Trade::K_SUM)
       trades.delete(rt)
     end
-  end     ### each trade[*rt*]
+  end  ### each trade[*rt*]
+  puts "calc_trades() #{'%.3f'%(Time.now - _start)}s"
+
+
   
-  ### print routes
-  routes_inc = trades.keys.sort_by {|rt| trades[rt][Trade::K_SUM].profit}
+  ### debug: print routes (increasing profit)
+  routes_sorted = trades.keys.sort_by {|rt| trades[rt][Trade::K_SUM].profit}
   last_rt = nil
   n = 0
-  routes_inc.each do |rt|
-    n+=1
-    last_rt = rt
+  routes_sorted.each do |rt|
     from_stn, to_stn = rt
+    last_rt = rt
+    n+=1
     totals = trades[rt][Trade::K_SUM]
     next if totals.profit == 0 
     next if totals.profit < min_route_profit
-    #next unless from_stn.hub? or to_stn.hub?
+    #next unless from_stn.hub? or to_stn.hub?  ### only show trades involving 1 hub
+    #next unless from_stn.hub? and to_stn.hub? ### only show trades involving 2 hubs
     
     puts "#{n}. #{from_stn.sname}  =>  #{to_stn.sname}"
     puts "=> $#{comma(totals.profit / 1_000_000.0)}M profit, #{comma_i totals.size.to_i} m3, #{'%.3f'%(totals.cost/1_000_000_000.0)}B cost"
     
-    ### sort most profitable first
+    ### sort: most profitable first
     sorted = trades[rt].values.sort do |a,b| b.profit <=> a.profit end 
     sorted.each do |t| 
-      next if t.item_id == Trade::K_SUM 
+      next if t.special? 
       puts "    $#{'%.1f' % (t.profit / 1_000_000.0)}M, #{comma_i t.qty}x #{t.item.name}, $#{'%.1f' % (t.ppv / 1_000.0)}K/m3"
       if t.profit > 100_000_000
+        ### print underlying orders
         t.asks.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
         puts "    ---"
         t.bids.each {|x| print "    #{x}"; puts x.ignore ? "" : " *"}
       end
     end
   end  ### trades[route]
-  puts "calc_trades() #{'%.3f'%(Time.now - _start)}s"
+
   
-  ### paste last route to clipboard
+  ### debug: paste last route to clipboard
   from_stn, to_stn = last_rt
   buf = "\n#{from_stn.sname} => #{to_stn.sname}\n\n"
   sorted = trades[last_rt].values.sort do |a,b| b.profit <=> a.profit end 
@@ -1842,8 +1857,8 @@ class WheatDB
     n = 0
     start2 = Time.now
     Trade.each do |tid, t|
-      t.asks.each do |o| q << "(#{o.id}, #{t.id})"; n+=1 end
-      t.bids.each do |o| q << "(#{o.id}, #{t.id})"; n+=1 end
+      t.asks.each do |o1| q << "(#{o1.id}, #{t.id})"; n+=1 end
+      t.bids.each do |o2| q << "(#{o2.id}, #{t.id})"; n+=1 end
     end
     t_str = Time.now - start2
     q.flush
@@ -1865,6 +1880,7 @@ while 1
   Marketlogs.import_orders                # populates Market[]
   trades = calc_trades(candidates)        # confirm trades against fresh market data
 
+  
   ### export to DB: orders, trades, orders_trades
 	STDERR.puts "------------\n"
   db2 = WheatDB.new("wheat_development")
