@@ -1300,6 +1300,7 @@ class Marketlogs < HTTPSource
   #assert_eq(region_id, Station[order.station_id].region_id, "Marketlogs.import_file() station-region mismatch")      
 
   EXPORT_DIR = "C:\\Users\\csserra\\Documents\\EVE\\logs\\Marketlogs\\"
+  MARKETLOG_DIR_OSX = "/Users/csserra/Library/Application Support/EVE Online/p_drive/User/My Documents/EVE/logs/Marketlogs"
   EXPORT_TTL = 3*24*60*60 # delete after 3 days
   
   ### purge_old() - delete older versions of marketlog files
@@ -1373,7 +1374,7 @@ class Marketlogs < HTTPSource
         end
       end
     end
-    puts "marketlogs imported #{Time.now - _start}s"
+    puts "marketlogs imported #{'%i'%((Time.now - _start)*1_000)}ms"
     update
   end
 
@@ -1385,7 +1386,7 @@ end ### class Marketlogs
 ### prefetch
 ###
 
-def prefetch(upto = 1028)
+def prefetch(upto = 1024)
   prefetch_start = Time.now
   puts ">>> prefetch.start <<<"
   ###
@@ -1672,7 +1673,7 @@ end   ### Trade class
 
 ### calc_trades() -- calculate trades by matching buy/sell orders; also filters for profit, scams, etc.
 ### in: candidates, Market[][]
-### out: trades
+### out: trades, Trade[]
 def calc_trades(candidates)
   _start = Time.now
 
@@ -1806,6 +1807,7 @@ def calc_trades(candidates)
   end  ### trades[route]
 
   
+=begin 
   ### debug: paste last route to clipboard
   from_stn, to_stn = last_rt
   buf = "\n#{from_stn.sname} => #{to_stn.sname}\n\n"
@@ -1820,6 +1822,7 @@ def calc_trades(candidates)
   puts "------\n"
   puts "Copy to clipboard:\n#{buf}"
   puts "------\n"
+=end
 
   trades
 end
@@ -1830,7 +1833,7 @@ class WheatDB
     @db = Mymysql.new(db_name)
   end
 
-  def export_orders
+  def _export_orders
     touch = {}
     Trade.each do |tid, t|
       t.asks.each do |o| touch[o.id] = true end
@@ -1842,11 +1845,11 @@ class WheatDB
     puts "       orders #{'%.1f'%((n - touch.keys.size)*100.0/n)}% chaff (#{comma_i(n - touch.keys.size)})"
   end
   
-  def export_trades
+  def _export_trades
     Trade.export_sql_table(@db, "trades")
   end
   
-  def export_orders_trades
+  def _export_orders_trades
     start = Time.now
     ### wipe table
     @db.query("TRUNCATE `orders_trades`;")
@@ -1865,11 +1868,19 @@ class WheatDB
     t_ins = Time.now - start
     puts "INSERT orders_trades x#{n} -- #{'%.3f'%t_ins}s (del #{'%.3f'%t_del}s, str #{'%.3f'%t_str}s, ins #{'%.3f'%(t_ins-t_del)}s)"
   end
+  
+  def export_sql
+    _export_orders
+    _export_trades
+    _export_orders_trades
+  end
 end
 
 
 ### main loop
 while 1
+  ### repeat main loop every 60 sec
+  next_loop = Time.now + 60
   $timers[:main] = Time.now
 
   prefetch
@@ -1884,12 +1895,10 @@ while 1
   ### export to DB: orders, trades, orders_trades
 	STDERR.puts "------------\n"
   db2 = WheatDB.new("wheat_development")
-  db2.export_orders
-  db2.export_trades
-  db2.export_orders_trades
+  db2.export_sql
 
   
-  ### runtime stats
+  ### DEBUG: runtime stats
 	STDERR.puts "------------\n"
   puts "full loop: #{Time.now - $timers[:main]}s"
   size = $counters[:size]; $counters[:size] = 0;
@@ -1906,9 +1915,12 @@ while 1
 	STDERR.puts "------------\n"
 
   
-  ### TODO: refresh Marketlogs every 5 sec
-  
-  ### repeat main loop every 60 sec
-  repeat_rem = [60 - (Time.now - $timers[:main]), 0].max
-	sleep repeat_rem
+  ### refresh Marketlogs every 1 sec
+  while (Time.now < next_loop)
+    if Marketlogs.import_orders then
+      calc_trades(candidates)
+      db2.export_sql
+    end
+    sleep 1
+  end
 end ### while 1
