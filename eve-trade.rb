@@ -80,9 +80,10 @@ class Cache
     elsif url.match("https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/") 
       ret = 20
     elsif url.match("/market/types/") or url.match("/regions/") or url.match("^https://crest-tq.eveonline.com/$")
-      ret = 24*60*60
+      ret = 24*60*60    # 24 hrs
     elsif url.match("ConquerableStationList")
-      ret = 24*60*60
+      #ret = 7*24*60*60  # 1 wk
+      ret = 60*60  # 1 hr
     elsif url.match("eve-central.com") 
       ret = 60  ### only need prefetch to carryover to actual fetch; see Cache.get() 
     ### server-defined TTLs
@@ -134,6 +135,7 @@ class Cache
   def self.get(k, now=Time.now)
     v, exp = @@cache[k]
     if v and now < exp
+      ### debug
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("^https://crest-tq.eveonline.com/?$")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("https://login-tq.eveonline.com/oauth/token/")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("https://crest-tq\\.eveonline\\.com/market/([0-9]{8})/orders/(buy|sell)/\\?type=https://crest-tq\\.eveonline\\.com/types/([0-9]+)/")
@@ -143,8 +145,7 @@ class Cache
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("/regions/10000001")
       puts "    cache hit #{to_m(exp-now)} #{Crest.pretty k}" if k.match("eve-central.com")
       puts "    cache hit #{to_m(exp-now)} ConquerableStationList" if k.match("ConquerableStationList")
-      @@hits += 1
-      
+
       ### special handling
       if k.match("https://login-tq.eveonline.com/oauth/token/") then
         ### access token contains a relative "expires_in", so we adjust it to actual TTL
@@ -157,6 +158,7 @@ class Cache
         @@cache.delete(k)
       end
 
+      @@hits += 1      
       v
     else
       nil
@@ -411,6 +413,7 @@ end
 ###   Region[name]
 ###   Station.each
 class EveDataCollection
+  @@hits = 0
   @data = {}
   def initialize(fields={})
     fields.each { |k,v| instance_variable_set("@#{k}", v) }
@@ -419,10 +422,12 @@ class EveDataCollection
   end
   
   def self.[]=(id, rval)
+    @@hits += 1
     @data[id] = rval
   end
   
   def self.[](id)
+    @@hits += 1
     @data[id]
   end
   
@@ -432,6 +437,10 @@ class EveDataCollection
 
   def self.delete(id)
     @data.delete(id)
+  end
+  
+  def self.hits
+    @@hits
   end
 
   ### adds <EveData>_id references to other EveData types
@@ -447,6 +456,7 @@ class EveDataCollection
       obj_name = id_name.chomp("_id")
       obj_klass = Object.const_get(obj_name.capitalize)
       define_method(obj_name) do obj_klass[instance_variable_get("@#{id_name}")] end ### safer than below?
+      ### alternative implementation
       #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end")              ### this also works
       #puts "ref_accessor(#{self.to_s}) :#{id_name}, :#{obj_name}()"
     end
@@ -457,7 +467,7 @@ end
 ### ImportSql module -- import DB table into EveDataCollection class datastore
 ### defined
 ###   import_sql()   -- "fieldmap" arg is src (DB field) => dst (instance variable) name mappings, for each field imported (class method)
-###   import_sdd()  -- import from Eve Static Data Dump
+###   import_sdd()   -- import from Eve Static Data Dump
 module ImportSql
   ### begin idiom for module class methods
   def self.included(base)
@@ -780,11 +790,13 @@ class Market
     @data[region]
   end
   
-  ### each_reg() -- blk(reg, Market[reg][])
+  ### each_reg() -- each region
+  ###   blk(reg, Market[reg][])
   def self.each_reg
     @data.each { |r, mkt_by_item| yield(r, mkt_by_item) }
   end  
-  ### each_reg() -- blk(reg, item, Market)
+  ### each() -- each market (region-item) 
+  ###   blk(reg, item, Market)
   def self.each
     @data.each_key do |r| 
       @data[r].each_key do |i|
@@ -1911,6 +1923,7 @@ while 1
   gets = $counters[:get]
 	puts "GETs: #{gets}"
 	puts "cache hits: #{Cache.hits} (#{'%.1f' % (Cache.hits.to_f * 100.0 / (Cache.hits + gets))}%)"; Cache.hits = 0
+  nrefs ||= 0; puts "object datastore hits #{comma_i(EveDataCollection.hits-nrefs)}"; nrefs = EveDataCollection.hits
   $counters[:get] = 0;
 	STDERR.puts "------------\n"
 
