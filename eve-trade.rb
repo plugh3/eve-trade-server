@@ -443,19 +443,20 @@ class EveDataCollection
     @@hits
   end
 
-  ### adds <EveData>_id references to other EveData types
+  ### adds <EveData>_id references to other EveData types (Region, Station, etc.)
   ### usage: "ref_accessor :region_id" adds methods for region_id(r) and region()
   def self.ref_accessor(*id_syms)
     id_syms.each do |id_sym|
       ### id accessor
-      attr_accessor id_sym
+      attr_accessor id_sym                              ### :region_id
 
       ### object accessor (dynamically defined)
-      ### ex: def Station.region { Region[@region_id] }
-      id_name = id_sym.to_s
-      obj_name = id_name.chomp("_id")
-      obj_klass = Object.const_get(obj_name.capitalize)
-      define_method(obj_name) do obj_klass[instance_variable_get("@#{id_name}")] end ### safer than below?
+      id_name = id_sym.to_s                             ### "region_id"
+      obj_name = id_name.chomp("_id")                   ### "region"
+      obj_klass = Object.const_get(obj_name.capitalize) ### "Region"
+      class_eval("def #{obj_name}; @#{obj_name} ||= #{obj_klass.to_s}[@#{id_name}]; @#{obj_name} end")
+      ### ex: "def Station.region { Region[@region_id] }"
+      #define_method(obj_name) do obj_klass[instance_variable_get("@#{id_name}")] end ### safer than below?
       ### alternative implementation
       #class_eval("def #{obj_name};#{ref_klass.to_s}[@#{id_name}];end")              ### this also works
       #puts "ref_accessor(#{self.to_s}) :#{id_name}, :#{obj_name}()"
