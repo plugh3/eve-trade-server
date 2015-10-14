@@ -444,7 +444,7 @@ class EveDataCollection
   end
 
   ### adds <EveData>_id references to other EveData types (Region, Station, etc.)
-  ### usage: "ref_accessor :region_id" adds methods for region_id(r) and region()
+  ### usage: "ref_accessor :region_id" adds methods for region_id() and region()
   def self.ref_accessor(*id_syms)
     id_syms.each do |id_sym|
       ### id accessor
@@ -1715,6 +1715,7 @@ def calc_trades(candidates)
   min_ppv = 1_000
   min_total_profit = 3_000_000
   min_route_profit = 20_000_000
+  ### profile: for 12 region routes, inner loop is ~40K iterations
   trades.each_key do |rt| 
     trades[rt].each_key do |item|
       next if item==Trade::K_SUM  ### aggregators
@@ -1747,7 +1748,7 @@ def calc_trades(candidates)
         t.cost += qty * ask.price
       end  ### match bids/asks
 
-      ### delete if no profitable matches (item)
+      ### delete item if no profitable matches
       if (i_ask == 0 and i_bid == 0) then Trade.delete(t.id); trades[rt].delete(item); next end
 
       ### derived calcs
@@ -1755,7 +1756,7 @@ def calc_trades(candidates)
       t.ppv = t.profit / t.size
       t.roi = t.profit / t.cost
 
-      ### delete if under profit thresholds, known scam, etc. (item)
+      ### delete item if under profit thresholds, known scam, etc.
       if t.profit < min_total_profit  then Trade.delete(t.id); trades[rt].delete(item); next end
       if t.ppv < min_ppv              then Trade.delete(t.id); trades[rt].delete(item); next end
       if t.suspicious?                then Trade.delete(t.id); trades[rt].delete(item); next end
@@ -1776,9 +1777,8 @@ def calc_trades(candidates)
       trades[rt][Trade::K_SUM] += t
     end  ### each trade[rt][*iid*]
     
-    ### delete if under profit threshold (route)
+    ### delete route if under profit threshold
     if trades[rt][Trade::K_SUM].profit < min_route_profit then
-      ### wipe entire route
       trades[rt].each do |item, t| Trade.delete(t.id); trades[rt].delete(item) end
       trades[rt].delete(Trade::K_SUM)
       trades.delete(rt)
@@ -1921,11 +1921,13 @@ while 1
 	#puts "overall time: " + $timers[:get].to_s + "s"; $timers[:get] = 0;
 	puts "trades: #{$counters[:profitables]}" ; $counters[:profitables] = 0;
 	puts "parse time:   " + ("%.1f" % ($timers[:parse] * 1_000.0)) + "ms"; $timers[:parse] = 0
-  gets = $counters[:get]
+
+  gets = $counters[:get]; $counters[:get] = 0
 	puts "GETs: #{gets}"
 	puts "cache hits: #{Cache.hits} (#{'%.1f' % (Cache.hits.to_f * 100.0 / (Cache.hits + gets))}%)"; Cache.hits = 0
+
   nrefs ||= 0; puts "object datastore hits #{comma_i(EveDataCollection.hits-nrefs)}"; nrefs = EveDataCollection.hits
-  $counters[:get] = 0;
+
 	STDERR.puts "------------\n"
 
   
